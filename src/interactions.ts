@@ -9,6 +9,8 @@
  *                 history rather than destructively rewinding.
  *   tag         — Create a Git tag pointing at the given commit SHA.
  *                 Useful for named release / checkpoint markers.
+ *   pull-now    — Trigger an immediate JSON-API pull from the configured
+ *                 GitHub remote, bypassing the 60 s tick.
  *
  * Interaction execute() functions return a short status string that
  * the host surfaces to the UI.
@@ -20,7 +22,7 @@ import * as gitops from "./git.js";
 import * as ops from "./operations.js";
 import type { GitFs } from "./fs-adapter.js";
 import { deserializeLink } from "./encoding.js";
-import type { LinkExpression } from "./types.js";
+import type { LinkExpression, PerspectiveDiff } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Interaction shapes (matching the Language interface)
@@ -45,6 +47,11 @@ export interface Interaction {
 export interface InteractionContext {
     fs: GitFs;
     agentDid: string;
+    /**
+     * Trigger an immediate JSON-API pull. Null when the language is
+     * running in local-only mode (no recognised remote provider).
+     */
+    pullNow?: (() => Promise<PerspectiveDiff>) | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +73,7 @@ export function buildInteractions(ctx: InteractionContext): Interaction[] {
         flushInteraction(),
         revertToInteraction(ctx),
         tagInteraction(ctx),
+        pullNowInteraction(ctx),
     ];
 }
 
@@ -181,6 +189,25 @@ function tagInteraction(ctx: InteractionContext): Interaction {
                 force: false,
             });
             return `tag: created '${name}' -> ${sha}`;
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// pull-now
+// ---------------------------------------------------------------------------
+
+function pullNowInteraction(ctx: InteractionContext): Interaction {
+    return {
+        label: "Pull now",
+        name: "pull-now",
+        parameters: [],
+        async execute() {
+            if (!ctx.pullNow) {
+                return "pull-now: language is running in local-only mode (no supported remote provider detected)";
+            }
+            const diff = await ctx.pullNow();
+            return `pull-now: applied diff +${diff.additions.length} -${diff.removals.length}`;
         },
     };
 }
