@@ -34,10 +34,9 @@ index.ts
     │   ├── git-state-at     (read tree at SHA)    │  src/git.ts (isomorphic-git wrappers)
     │   └── git-blame        (find introducing commit) │
     └── interactions          → src/interactions.ts ─┤
-        ├── flush             (gated; see below)    │
+        ├── flush             (push, follow-up PR)  │
         ├── revert-to         (forward inverse)     │
-        ├── tag                                     │
-        └── pull-now          (immediate JSON pull) │
+        └── tag                                     │
                                                     │
 src/providers/github.ts ← JSON REST client for GitHub (refs/commits/trees/blobs)
 src/remote-sync.ts ← chained-setTimeout pull loop (default 60 s, ETag-conditional)
@@ -80,7 +79,7 @@ The Language closes the loop by talking to Git provider **JSON REST APIs** inste
 2. When the ref SHA changes, the Language fetches the commit, walks the tree recursively, fetches any newly-needed blobs, decodes them from base64, and applies the resulting diff via the standard `commit` path. The local cache + emitted `PerspectiveDiff` update like any other addLink/removeLink.
 3. The remote SHA and ETag are persisted in the cache so reboots resume cleanly.
 
-**Manual override:** the `pull-now` interaction (§ Interactions) triggers an immediate pull, bypassing the 60-second tick — useful for "refresh" buttons in UIs.
+**On-demand mode (`PULL_INTERVAL_MS=0`):** the background timer is disabled, but the standard `perspective-sync.sync()` capability still routes through the same JSON-API pull. Apps trigger refreshes by calling the AD4M `perspective.pullLinks` / `perspective.sync()` RPC — useful when polling is wasteful and the UI knows when state should change (e.g. after a user "refresh" action, or driven by an external signal).
 
 **Push** (after a local `addLink`) is the follow-up: POST `/git/blobs` (base64), POST `/git/trees`, POST `/git/commits`, PATCH `/git/refs/heads/<branch>`. Same plumbing, opposite direction. Wired in a subsequent PR.
 
@@ -164,10 +163,11 @@ For a specific link hash, locate the commit that introduced it (and the commit t
 
 | Name        | Parameters         | Effect                                                                                |
 |-------------|--------------------|---------------------------------------------------------------------------------------|
-| `pull-now`  | none               | Trigger an immediate JSON-API pull, bypassing the 60-second tick. Returns the diff.   |
 | `flush`     | none               | Force a push (push path is the follow-up; no-op in v1).                               |
 | `revert-to` | `sha: string`      | Compute the forward inverse and commit it. Preserves history.                         |
 | `tag`       | `name`, `sha`      | Create a Git tag at the given commit.                                                 |
+
+For **"refresh against remote"** semantics, apps use the standard `perspective-sync.sync()` capability — call `perspective.pullLinks(uuid)` or `perspective.sync(uuid)` through the AD4M client. The Language routes that call through the same JSON-API pull as the background timer and returns the resulting diff. No separate interaction needed.
 
 ---
 
@@ -205,8 +205,8 @@ pnpm build      # → build/bundle.js (~624KB, includes isomorphic-git)
 │   ├── remote-sync.ts         # chained-setTimeout pull loop + pullOnce
 │   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag
 │   ├── queries.ts             # link-pattern + git-history + git-state-at + git-blame
-│   ├── interactions.ts        # pull-now, flush, revert-to, tag
-│   └── operations.ts          # commit, sync, render, currentRevision, boot
+│   ├── interactions.ts        # flush, revert-to, tag
+│   └── operations.ts          # commit, sync (pull-routed), render, currentRevision, boot
 ├── tests/
 │   ├── encoding.test.ts
 │   ├── fs-adapter.test.ts

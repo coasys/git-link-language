@@ -328,6 +328,7 @@ describe("startRemoteSync: lifecycle", () => {
             fs,
             agentDid: TEST_DID,
         });
+        assert.ok(handle, "expected a handle for positive interval");
         handle.stop();
         // Wait long enough that a tick would have fired if not stopped
         await new Promise((r) => setTimeout(r, 50));
@@ -345,6 +346,7 @@ describe("startRemoteSync: lifecycle", () => {
             fs,
             agentDid: TEST_DID,
         });
+        assert.ok(handle);
         try {
             const diff = await handle.pullOnce();
             assert.deepEqual(diff, { additions: [], removals: [] });
@@ -352,5 +354,59 @@ describe("startRemoteSync: lifecycle", () => {
         } finally {
             handle.stop();
         }
+    });
+
+    it("returns null when intervalMs is zero (on-demand mode)", () => {
+        const transport = new MockTransport(() => notModified());
+        const provider = buildProvider(transport);
+        const handle = startRemoteSync({
+            provider,
+            branch: "main",
+            intervalMs: 0,
+            fs,
+            agentDid: TEST_DID,
+        });
+        assert.equal(handle, null);
+    });
+
+    it("returns null when intervalMs is negative", () => {
+        const transport = new MockTransport(() => notModified());
+        const provider = buildProvider(transport);
+        const handle = startRemoteSync({
+            provider,
+            branch: "main",
+            intervalMs: -5,
+            fs,
+            agentDid: TEST_DID,
+        });
+        assert.equal(handle, null);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// ops.sync — routes through the provider when a pull strategy is supplied
+// ---------------------------------------------------------------------------
+
+describe("ops.sync: pull-strategy routing", () => {
+    beforeEach(setup);
+
+    it("invokes the supplied pull strategy when provided", async () => {
+        let called = 0;
+        const diff: PerspectiveDiff = { additions: [], removals: [] };
+        const result = await ops.sync({
+            fs,
+            pull: async () => {
+                called += 1;
+                return diff;
+            },
+        });
+        assert.equal(called, 1);
+        assert.equal(result, diff);
+    });
+
+    it("falls through to local HEAD detection when no pull strategy is provided", async () => {
+        // No commits yet — local detection returns empty
+        const result = await ops.sync({ fs });
+        assert.deepEqual(result, { additions: [], removals: [] });
     });
 });

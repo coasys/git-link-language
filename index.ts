@@ -47,6 +47,7 @@ import * as store from "./src/store.js";
 import { buildInteractions } from "./src/interactions.js";
 import { GitHubProvider, parseGitHubUrl } from "./src/providers/github.js";
 import {
+    pullOnce,
     startRemoteSync,
     type RemoteSyncHandle,
 } from "./src/remote-sync.js";
@@ -86,7 +87,8 @@ void PUSH_DEBOUNCE_MS;
 
 let myDid: string = "";
 let fs: GitFs | null = null;
-let remoteSync: RemoteSyncHandle | null = null;
+let remoteProvider: GitHubProvider | null = null;
+let remoteSyncHandle: RemoteSyncHandle | null = null;
 
 function getFs(): GitFs {
     if (!fs) {
@@ -116,43 +118,61 @@ export async function init(): Promise<void> {
     fs = createFsAdapter(getStorage());
     await ops.boot({ fs, defaultBranch: DEFAULT_BRANCH });
 
-    // Start the JSON-API pull loop if a supported provider is detected
-    // in REMOTE_URL. Unknown / unset remotes leave the language in
-    // local-only mode — `sync()` still detects external HEAD movement.
-    remoteSync = maybeStartRemoteSync();
+    // Detect a supported remote provider from REMOTE_URL. When set,
+    // both the background timer (if PULL_INTERVAL_MS > 0) and the
+    // standard `perspective-sync.sync()` capability route through this
+    // provider. PULL_INTERVAL_MS=0 disables the timer but leaves the
+    // manual sync RPC fully functional — apps trigger pulls via
+    // `perspective.pullLinks` / `perspective.sync()` whenever they
+    // want fresh state (e.g. on a user "refresh" action).
+    remoteProvider = detectProvider();
+
+    if (remoteProvider) {
+        const intervalMs = Number.parseInt(PULL_INTERVAL_MS, 10);
+        remoteSyncHandle = startRemoteSync({
+            provider: remoteProvider,
+            branch: DEFAULT_BRANCH,
+            intervalMs,
+            fs: getFs(),
+            agentDid: myDid,
+        });
+    }
 }
 
-function maybeStartRemoteSync(): RemoteSyncHandle | null {
+function detectProvider(): GitHubProvider | null {
     if (!REMOTE_URL || REMOTE_URL === "<to-be-filled>") return null;
     const ghRef = parseGitHubUrl(REMOTE_URL);
     if (!ghRef) return null;
-    const intervalMs = Number.parseInt(PULL_INTERVAL_MS, 10);
-    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return null;
-    const provider = new GitHubProvider(getTransport(), ghRef, AUTH_TOKEN);
-    return startRemoteSync({
-        provider,
-        branch: DEFAULT_BRANCH,
-        intervalMs,
-        fs: getFs(),
-        agentDid: myDid,
-    });
+    return new GitHubProvider(getTransport(), ghRef, AUTH_TOKEN);
+}
+
+function buildPullStrategy(): (() => Promise<PerspectiveDiff>) | null {
+    if (!remoteProvider || !fs) return null;
+    const provider = remoteProvider;
+    const targetFs = fs;
+    const did = myDid;
+    return () =>
+        pullOnce({
+            provider,
+            branch: DEFAULT_BRANCH,
+            intervalMs: 0,
+            fs: targetFs,
+            agentDid: did,
+        });
 }
 
 export async function teardown(): Promise<void> {
-    if (remoteSync) {
-        remoteSync.stop();
-        remoteSync = null;
+    if (remoteSyncHandle) {
+        remoteSyncHandle.stop();
+        remoteSyncHandle = null;
     }
+    remoteProvider = null;
     myDid = "";
     fs = null;
 }
 
 export function interactions(_address: string) {
-    const ctx = {
-        fs: getFs(),
-        agentDid: myDid,
-        pullNow: remoteSync ? remoteSync.pullOnce : null,
-    };
+    const ctx = { fs: getFs(), agentDid: myDid };
     return buildInteractions(ctx);
 }
 
@@ -171,7 +191,7 @@ export async function perspectiveCommit(
 // ----- perspective-sync -----------------------------------------------------
 
 export async function perspectiveSyncSync(): Promise<PerspectiveDiff> {
-    return await ops.sync({ fs: getFs() });
+    return await ops.sync({ fs: getFs(), pull: buildPullStrategy() });
 }
 
 export async function perspectiveSyncRender() {

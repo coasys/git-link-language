@@ -171,14 +171,22 @@ export async function pullOnce(opts: RemoteSyncOpts): Promise<PerspectiveDiff> {
 
 /**
  * Start a background loop that calls {@link pullOnce} every
- * `intervalMs` milliseconds. Returns a handle with `stop()` and a
- * direct `pullOnce()` so the `pull-now` interaction can trigger an
- * immediate pull without waiting for the next tick.
+ * `intervalMs` milliseconds.
+ *
+ * Returns `null` when `intervalMs <= 0` — in that mode the Language
+ * runs in **on-demand** sync: the timer is disabled, but the standard
+ * `perspective-sync.sync()` capability still routes through the
+ * provider, so apps can trigger pulls explicitly via the AD4M
+ * `perspective.pullLinks` / `perspective.sync()` RPC.
  *
  * The loop is fault-tolerant: errors are logged and swallowed so a
- * transient 429 or network blip does not break the chain.
+ * transient 429 or network blip cannot break the chain.
  */
-export function startRemoteSync(opts: RemoteSyncOpts): RemoteSyncHandle {
+export function startRemoteSync(opts: RemoteSyncOpts): RemoteSyncHandle | null {
+    if (!Number.isFinite(opts.intervalMs) || opts.intervalMs <= 0) {
+        return null;
+    }
+
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
