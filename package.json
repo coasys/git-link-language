@@ -1,0 +1,21 @@
+{
+  "name": "@coasys/git-link-language",
+  "version": "0.1.0",
+  "description": "AD4M Link Language backing Perspectives with a Git repository",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "build": "deno run --allow-all esbuild.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-vm-modules --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@coasys/ad4m-ldk": "link:../ad4m/ad4m-ldk/js",
+    "isomorphic-git": "^1.27.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.16.0",
+    "@types/node": "^20.0.0"
+  }
+}
