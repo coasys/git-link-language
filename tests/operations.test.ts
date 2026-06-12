@@ -118,6 +118,86 @@ describe("ops: commit + render", () => {
         assert.equal(runtime.emittedDiffs[0].additions.length, 1);
     });
 
+    it("batches an N-link diff into a single Git commit", async () => {
+        const links = [
+            makeLink({ source: "a", target: "1" }),
+            makeLink({ source: "b", target: "2" }),
+            makeLink({ source: "c", target: "3" }),
+            makeLink({ source: "d", target: "4" }),
+            makeLink({ source: "e", target: "5" }),
+        ];
+        const sha = await ops.commit({
+            fs,
+            diff: { additions: links, removals: [] },
+            authorDid: TEST_DID,
+        });
+        assert.match(sha, /^[a-f0-9]{40}$/);
+
+        // One commit, five link files
+        const historyResult = await queries.runQuery(
+            { kind: "git-history", payload: {} },
+            fs,
+        );
+        const records = historyResult.payload as Array<{
+            additions: string[];
+            removals: string[];
+        }>;
+        assert.equal(records.length, 1, "expected exactly one commit for the batch");
+        assert.equal(records[0].additions.length, 5);
+        assert.equal(records[0].removals.length, 0);
+
+        // All five links render
+        assert.equal(ops.render().links.length, 5);
+
+        // Exactly one PerspectiveDiff was emitted
+        assert.equal(runtime.emittedDiffs.length, 1);
+        assert.equal(runtime.emittedDiffs[0].additions.length, 5);
+    });
+
+    it("batches mixed additions + removals into a single commit", async () => {
+        // Seed two links so we can remove them
+        const seedA = makeLink({ source: "seed-a" });
+        const seedB = makeLink({ source: "seed-b" });
+        await ops.commit({
+            fs,
+            diff: { additions: [seedA, seedB], removals: [] },
+            authorDid: TEST_DID,
+        });
+
+        // Now apply a mixed diff: drop seedA, add three new links
+        const newOnes = [
+            makeLink({ source: "new-1" }),
+            makeLink({ source: "new-2" }),
+            makeLink({ source: "new-3" }),
+        ];
+        runtime.emittedDiffs.length = 0;
+        const sha = await ops.commit({
+            fs,
+            diff: { additions: newOnes, removals: [seedA] },
+            authorDid: TEST_DID,
+        });
+        assert.match(sha, /^[a-f0-9]{40}$/);
+
+        // The new commit shows +3 -1 in one record
+        const historyResult = await queries.runQuery(
+            { kind: "git-history", payload: { limit: 1 } },
+            fs,
+        );
+        const records = historyResult.payload as Array<{
+            additions: string[];
+            removals: string[];
+        }>;
+        assert.equal(records.length, 1);
+        assert.equal(records[0].additions.length, 3);
+        assert.equal(records[0].removals.length, 1);
+
+        // Final state: seedB + three new links = 4
+        assert.equal(ops.render().links.length, 4);
+
+        // One emission for the whole batch
+        assert.equal(runtime.emittedDiffs.length, 1);
+    });
+
     it("commits an addition and then a removal", async () => {
         const link = makeLink();
         await ops.commit({

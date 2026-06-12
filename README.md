@@ -1,6 +1,6 @@
 # Git Link Language for AD4M
 
-An AD4M Link Language that backs Perspectives with a real Git repository. Every link change is one commit, full history is queryable, and the underlying repo is inspectable through any standard Git tool.
+An AD4M Link Language that backs Perspectives with a real Git repository. Every `PerspectiveDiff` lands as one signed commit — a single `addLink` and a bulk `addLinks(N)` both collapse to one commit each. Full history is queryable, and the underlying repo is inspectable through any standard Git tool.
 
 Built with the modern [ALDK](https://github.com/coasys/ad4m/tree/dev/ad4m-ldk) (`@coasys/ad4m-ldk`) pattern.
 
