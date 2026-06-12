@@ -1,14 +1,19 @@
 /**
  * User-invocable interactions exposed by the Language.
  *
- *   flush       — Force an immediate remote push (no-op in v1; the binary
- *                 HTTP gap means automated push is gated on a future host
- *                 enhancement).
+ *   flush       — Force an immediate remote push (no-op in v1; the
+ *                 push path is the next PR).
  *   revert-to   — Compute the forward diff that takes the current state
  *                 back to a past commit's state and commit it. Preserves
  *                 history rather than destructively rewinding.
  *   tag         — Create a Git tag pointing at the given commit SHA.
  *                 Useful for named release / checkpoint markers.
+ *
+ * For "pull now" / "refresh against remote" semantics, apps should
+ * call the standard `perspective-sync.sync()` capability via the
+ * AD4M `perspective.pullLinks` / `perspective.sync()` RPC. That route
+ * goes through the same JSON-API pull as the background timer and
+ * returns the resulting diff — no separate interaction needed.
  *
  * Interaction execute() functions return a short status string that
  * the host surfaces to the UI.
@@ -79,7 +84,7 @@ function flushInteraction(): Interaction {
         name: "flush",
         parameters: [],
         async execute() {
-            return "flush: no-op (automated remote push is gated on binary HTTP host support; see spec §11.2)";
+            return "flush: no-op (push lands in the next PR; until then only pull is wired)";
         },
     };
 }
@@ -184,3 +189,4 @@ function tagInteraction(ctx: InteractionContext): Interaction {
         },
     };
 }
+

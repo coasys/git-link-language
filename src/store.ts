@@ -196,6 +196,19 @@ export function allLinks(): Perspective {
 }
 
 // ---------------------------------------------------------------------------
+// Raw cache access (used by the remote-sync module for tracking the
+// last-known remote SHA and the ETag for conditional ref polls)
+// ---------------------------------------------------------------------------
+
+export function getStorageRaw(key: string): string | null {
+    return getStorage().get(key);
+}
+
+export function setStorageRaw(key: string, value: string): void {
+    getStorage().put(key, value);
+}
+
+// ---------------------------------------------------------------------------
 // Revision tracking
 // ---------------------------------------------------------------------------
 

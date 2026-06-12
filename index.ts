@@ -11,13 +11,16 @@
  *     `git-state-at`, and `git-blame` query kinds.
  *   - Standard `link-pattern` queries against an in-memory cache for
  *     fast SDNA-driven traversal.
- *   - `revert-to` and `tag` interactions for history navigation.
+ *   - `revert-to`, `tag`, and `pull-now` interactions.
  *
- * Remote sync via `git fetch`/`git push` is NOT wired in v1: the
- * executor's `httpFetch` returns response bodies as UTF-8 strings,
- * which mangles binary Git pack files. Sync therefore detects HEAD
- * movement applied externally (via the host's Git CLI or via shared
- * storage) and emits the resulting PerspectiveDiff. See spec §11.2.
+ * Remote sync uses GitHub's JSON REST API (refs / commits / trees /
+ * blobs) because the executor's `httpFetch` UTF-8-decodes response
+ * bodies and would corrupt binary Git pack files. The pull loop is an
+ * in-language `setTimeout` chain (default 60 s, configurable via
+ * `PULL_INTERVAL_MS`) that calls `pullOnce()` and applies any diff
+ * locally. Conditional `If-None-Match` requests turn idle polling into
+ * 304s that do not count against GitHub's rate limit. See spec §11.2
+ * for the gap that this design closes.
  */
 
 import { agentDid, hash } from "@coasys/ad4m-ldk";
@@ -28,6 +31,7 @@ import {
     initRuntime,
     initSigning,
     getStorage,
+    getTransport,
 } from "./src/adapters.js";
 import {
     DenoStorageAdapter,
@@ -41,6 +45,12 @@ import * as ops from "./src/operations.js";
 import * as queries from "./src/queries.js";
 import * as store from "./src/store.js";
 import { buildInteractions } from "./src/interactions.js";
+import { GitHubProvider, parseGitHubUrl } from "./src/providers/github.js";
+import {
+    pullOnce,
+    startRemoteSync,
+    type RemoteSyncHandle,
+} from "./src/remote-sync.js";
 import type { PerspectiveDiff } from "./src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -62,12 +72,12 @@ const MERGE_POLICY = "add-wins";
 //!@ad4m-template-variable
 const PUSH_DEBOUNCE_MS = "5000";
 
-// These template variables are captured for forward compatibility with
-// the remote sync path (gated by binary HTTP, see spec §11.2). v1 does
-// not read them at runtime, but they must appear in the bundle so the
-// executor can replace them at publish time.
-void REMOTE_URL;
-void AUTH_TOKEN;
+//!@ad4m-template-variable
+const PULL_INTERVAL_MS = "60000";
+
+// MERGE_POLICY and PUSH_DEBOUNCE_MS are captured for the push path
+// that lands in a follow-up. v1 of the pull loop reads REMOTE_URL,
+// AUTH_TOKEN, DEFAULT_BRANCH, and PULL_INTERVAL_MS.
 void MERGE_POLICY;
 void PUSH_DEBOUNCE_MS;
 
@@ -77,6 +87,8 @@ void PUSH_DEBOUNCE_MS;
 
 let myDid: string = "";
 let fs: GitFs | null = null;
+let remoteProvider: GitHubProvider | null = null;
+let remoteSyncHandle: RemoteSyncHandle | null = null;
 
 function getFs(): GitFs {
     if (!fs) {
@@ -105,9 +117,56 @@ export async function init(): Promise<void> {
     myDid = agentDid();
     fs = createFsAdapter(getStorage());
     await ops.boot({ fs, defaultBranch: DEFAULT_BRANCH });
+
+    // Detect a supported remote provider from REMOTE_URL. When set,
+    // both the background timer (if PULL_INTERVAL_MS > 0) and the
+    // standard `perspective-sync.sync()` capability route through this
+    // provider. PULL_INTERVAL_MS=0 disables the timer but leaves the
+    // manual sync RPC fully functional — apps trigger pulls via
+    // `perspective.pullLinks` / `perspective.sync()` whenever they
+    // want fresh state (e.g. on a user "refresh" action).
+    remoteProvider = detectProvider();
+
+    if (remoteProvider) {
+        const intervalMs = Number.parseInt(PULL_INTERVAL_MS, 10);
+        remoteSyncHandle = startRemoteSync({
+            provider: remoteProvider,
+            branch: DEFAULT_BRANCH,
+            intervalMs,
+            fs: getFs(),
+            agentDid: myDid,
+        });
+    }
+}
+
+function detectProvider(): GitHubProvider | null {
+    if (!REMOTE_URL || REMOTE_URL === "<to-be-filled>") return null;
+    const ghRef = parseGitHubUrl(REMOTE_URL);
+    if (!ghRef) return null;
+    return new GitHubProvider(getTransport(), ghRef, AUTH_TOKEN);
+}
+
+function buildPullStrategy(): (() => Promise<PerspectiveDiff>) | null {
+    if (!remoteProvider || !fs) return null;
+    const provider = remoteProvider;
+    const targetFs = fs;
+    const did = myDid;
+    return () =>
+        pullOnce({
+            provider,
+            branch: DEFAULT_BRANCH,
+            intervalMs: 0,
+            fs: targetFs,
+            agentDid: did,
+        });
 }
 
 export async function teardown(): Promise<void> {
+    if (remoteSyncHandle) {
+        remoteSyncHandle.stop();
+        remoteSyncHandle = null;
+    }
+    remoteProvider = null;
     myDid = "";
     fs = null;
 }
@@ -132,7 +191,7 @@ export async function perspectiveCommit(
 // ----- perspective-sync -----------------------------------------------------
 
 export async function perspectiveSyncSync(): Promise<PerspectiveDiff> {
-    return await ops.sync({ fs: getFs() });
+    return await ops.sync({ fs: getFs(), pull: buildPullStrategy() });
 }
 
 export async function perspectiveSyncRender() {
@@ -186,4 +245,5 @@ export const possibleTemplateParams: string[] = [
     "AUTH_TOKEN",
     "MERGE_POLICY",
     "PUSH_DEBOUNCE_MS",
+    "PULL_INTERVAL_MS",
 ];

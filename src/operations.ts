@@ -123,21 +123,34 @@ export async function commit(opts: CommitOpts): Promise<string> {
 // ---------------------------------------------------------------------------
 
 /**
- * Detect any HEAD movement since the last observed state and emit
- * the resulting diff. Useful when the user (or another process)
- * applies commits to the underlying repo externally — e.g. via the
- * Git CLI — and then calls sync() so AD4M picks the changes up.
+ * Sync against the configured remote, if one is set, or detect local
+ * HEAD movement otherwise.
  *
- * Note: this does NOT fetch from a remote. v1 cannot perform binary
- * HTTP, so automated remote sync is gated on a future host
- * enhancement. See spec §11.2.
+ *   - With a JSON-API provider (currently GitHub): poll the remote
+ *     ref with `If-None-Match` and apply any new state. This is the
+ *     same code path the background pull timer uses, so apps can
+ *     trigger an explicit sync via `perspective.pullLinks` /
+ *     `perspective.sync()` RPC and get a fresh remote pull on demand.
+ *   - Without a provider: walk the local repo for HEAD movement
+ *     applied externally (shared filesystem, external `git pull`).
+ *
+ * Both paths emit a `PerspectiveDiff` and return it.
  */
 export interface SyncOpts {
     fs: GitFs;
+    /** Optional pull strategy — when set, sync() runs a remote pull. */
+    pull?: (() => Promise<PerspectiveDiff>) | null;
 }
 
 export async function sync(opts: SyncOpts): Promise<PerspectiveDiff> {
-    const head = await gitops.currentHead(opts.fs);
+    if (opts.pull) {
+        return await opts.pull();
+    }
+    return await detectLocalHeadMovement(opts.fs);
+}
+
+async function detectLocalHeadMovement(fs: GitFs): Promise<PerspectiveDiff> {
+    const head = await gitops.currentHead(fs);
     if (head === null) {
         return { additions: [], removals: [] };
     }
@@ -147,11 +160,11 @@ export async function sync(opts: SyncOpts): Promise<PerspectiveDiff> {
     }
 
     const { additions: addHashes, removals: removeHashes } =
-        await gitops.diffLinks(opts.fs, lastSynced, head);
+        await gitops.diffLinks(fs, lastSynced, head);
 
     const additions: LinkExpression[] = [];
     for (const h of addHashes) {
-        const raw = await gitops.readLinkAt(opts.fs, head, h);
+        const raw = await gitops.readLinkAt(fs, head, h);
         if (!raw) continue;
         try {
             additions.push(deserializeLink(raw));
@@ -165,7 +178,7 @@ export async function sync(opts: SyncOpts): Promise<PerspectiveDiff> {
     const removals: LinkExpression[] = [];
     if (lastSynced) {
         for (const h of removeHashes) {
-            const raw = await gitops.readLinkAt(opts.fs, lastSynced, h);
+            const raw = await gitops.readLinkAt(fs, lastSynced, h);
             if (!raw) continue;
             try {
                 removals.push(deserializeLink(raw));

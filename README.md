@@ -1,6 +1,6 @@
 # Git Link Language for AD4M
 
-An AD4M Link Language that backs Perspectives with a real Git repository. Every link change is one commit, full history is queryable, and the underlying repo is inspectable through any standard Git tool.
+An AD4M Link Language that backs Perspectives with a real Git repository. Every `PerspectiveDiff` lands as one signed commit — a single `addLink` and a bulk `addLinks(N)` both collapse to one commit each. Full history is queryable, and the underlying repo is inspectable through any standard Git tool.
 
 Built with the modern [ALDK](https://github.com/coasys/ad4m/tree/dev/ad4m-ldk) (`@coasys/ad4m-ldk`) pattern.
 
@@ -34,11 +34,13 @@ index.ts
     │   ├── git-state-at     (read tree at SHA)    │  src/git.ts (isomorphic-git wrappers)
     │   └── git-blame        (find introducing commit) │
     └── interactions          → src/interactions.ts ─┤
-        ├── flush             (gated; see below)    │
+        ├── flush             (push, follow-up PR)  │
         ├── revert-to         (forward inverse)     │
         └── tag                                     │
                                                     │
-src/store.ts      ← in-memory cache (links, indexes, revision)
+src/providers/github.ts ← JSON REST client for GitHub (refs/commits/trees/blobs)
+src/remote-sync.ts ← chained-setTimeout pull loop (default 60 s, ETag-conditional)
+src/store.ts      ← in-memory cache (links, indexes, revision, remote-sha, etag)
 src/fs-adapter.ts ← isomorphic-git fs over storage KV (base64-encoded binary)
 src/http-transport.ts ← iso-git HttpClient over httpFetch (binary-blocked, see below)
 src/encoding.ts   ← base64, UTF-8, link hashing, link file paths
@@ -57,23 +59,31 @@ A Perspective is a Git repository under the language's storage directory. Each l
 
 ---
 
-## Known Limitation: Remote Sync
+## Remote sync
 
-Git smart-protocol responses are **binary** (pack files). The executor's `httpFetch` returns response bodies as UTF-8 strings, which mangles non-UTF-8 bytes via U+FFFD replacement. Until the host exposes a binary HTTP primitive (`httpFetchBytes`), this Language **cannot** perform automated `git fetch` or `git push` against any Git server. This is a fundamental host-contract gap, not a missing feature in the Language.
+Git smart-protocol responses are binary (pack files). The executor's `httpFetch` returns response bodies as UTF-8 strings, which mangles non-UTF-8 bytes via U+FFFD replacement. The smart-protocol path is therefore unreachable.
 
-**What works today:**
+The Language closes the loop by talking to Git provider **JSON REST APIs** instead — refs, commits, trees, and blobs (base64-encoded content) all round-trip cleanly through `httpFetch` because they are valid UTF-8 on the wire.
 
-- Two peers sharing the underlying repo storage (network mount, Syncthing, etc.) — `sync()` detects HEAD movement and emits the resulting `PerspectiveDiff`.
-- A user running `git pull` from their terminal against the language storage directory, then calling `sync()` in AD4M.
-- All local commits, history queries, blame, time-travel reads, revert.
+**v1 provider support:**
 
-**What waits on a host enhancement:**
+| Provider | Pull | Push | Notes |
+|---|---|---|---|
+| GitHub (`github.com/<o>/<r>`) | ✅ Automatic, 60 s default | ⚠️ Follow-up | Uses `/repos/<o>/<r>/git/{refs,commits,trees,blobs}` |
+| GitLab / Gitea | Planned | ⚠️ Follow-up | Same shape, different URL prefix |
+| Self-hosted Git / Radicle web seed | Manual fallback | ⚠️ Follow-up | Configure as opaque remote; pull via external `git pull` + AD4M `sync()` |
 
-- Automated push to a remote on commit.
-- Automated fetch on `sync()`.
-- See spec §11.2 in [git-link-language.md](https://github.com/HexaField/git-link-language/blob/main/spec/git-link-language.md) and §5.1 of the successor spec for the host-contract changes that unblock this.
+**How the pull loop works:**
 
-The `REMOTE_URL`, `AUTH_TOKEN`, and related template variables are captured in the bundle and ready to be read by the network code path the moment the host gains binary HTTP support.
+1. Every `PULL_INTERVAL_MS` (default 60 s), the Language calls `GET /git/refs/heads/<branch>` with `If-None-Match: <last-etag>`. GitHub returns **304 Not Modified** for unchanged refs, and 304s do not count against the rate limit — idle Perspectives are essentially free.
+2. When the ref SHA changes, the Language fetches the commit, walks the tree recursively, fetches any newly-needed blobs, decodes them from base64, and applies the resulting diff via the standard `commit` path. The local cache + emitted `PerspectiveDiff` update like any other addLink/removeLink.
+3. The remote SHA and ETag are persisted in the cache so reboots resume cleanly.
+
+**On-demand mode (`PULL_INTERVAL_MS=0`):** the background timer is disabled, but the standard `perspective-sync.sync()` capability still routes through the same JSON-API pull. Apps trigger refreshes by calling the AD4M `perspective.pullLinks` / `perspective.sync()` RPC — useful when polling is wasteful and the UI knows when state should change (e.g. after a user "refresh" action, or driven by an external signal).
+
+**Push** (after a local `addLink`) is the follow-up: POST `/git/blobs` (base64), POST `/git/trees`, POST `/git/commits`, PATCH `/git/refs/heads/<branch>`. Same plumbing, opposite direction. Wired in a subsequent PR.
+
+**Local-only fallback:** if `REMOTE_URL` is unset or points at an unsupported host (raw self-hosted Git, Radicle web seeds), the Language runs in local-only mode. `sync()` still detects external HEAD movement and emits the diff for two-peer setups that share storage out-of-band.
 
 ---
 
@@ -81,22 +91,31 @@ The `REMOTE_URL`, `AUTH_TOKEN`, and related template variables are captured in t
 
 ```typescript
 //!@ad4m-template-variable
-const REMOTE_URL = "<to-be-filled>";        // e.g. "https://github.com/me/perspective.git" (captured for future use)
+const REMOTE_URL = "<to-be-filled>";        // e.g. "https://github.com/me/perspective.git"
 
 //!@ad4m-template-variable
 const DEFAULT_BRANCH = "main";
 
 //!@ad4m-template-variable
-const AUTH_TOKEN = "";                       // captured; not read in v1
+const AUTH_TOKEN = "";                       // GitHub PAT, sent as "Authorization: token <pat>"
 
 //!@ad4m-template-variable
-const MERGE_POLICY = "add-wins";             // add-wins | remove-wins (captured; not yet acted on in v1)
+const PULL_INTERVAL_MS = "60000";            // pull cadence; 0 or unset disables the loop
 
 //!@ad4m-template-variable
-const PUSH_DEBOUNCE_MS = "5000";             // captured; not yet acted on in v1
+const MERGE_POLICY = "add-wins";             // add-wins | remove-wins (push-side; not yet acted on)
+
+//!@ad4m-template-variable
+const PUSH_DEBOUNCE_MS = "5000";             // push-side; not yet acted on
 ```
 
-`DEFAULT_BRANCH` is the one variable v1 acts on — it's the branch the Language operates against. The rest are captured for forward compatibility with the remote-sync path.
+**Active in v1:**
+
+- `REMOTE_URL`, `AUTH_TOKEN`, `PULL_INTERVAL_MS`, `DEFAULT_BRANCH` — drive the JSON-API pull loop.
+
+**Captured for the push follow-up:**
+
+- `MERGE_POLICY`, `PUSH_DEBOUNCE_MS`.
 
 ---
 
@@ -142,11 +161,13 @@ For a specific link hash, locate the commit that introduced it (and the commit t
 
 ## Interactions
 
-| Name        | Parameters         | Effect                                                        |
-|-------------|--------------------|---------------------------------------------------------------|
-| `flush`     | none               | No-op in v1 (gated by binary HTTP).                           |
-| `revert-to` | `sha: string`      | Compute the forward inverse and commit it. Preserves history. |
-| `tag`       | `name`, `sha`      | Create a Git tag at the given commit.                         |
+| Name        | Parameters         | Effect                                                                                |
+|-------------|--------------------|---------------------------------------------------------------------------------------|
+| `flush`     | none               | Force a push (push path is the follow-up; no-op in v1).                               |
+| `revert-to` | `sha: string`      | Compute the forward inverse and commit it. Preserves history.                         |
+| `tag`       | `name`, `sha`      | Create a Git tag at the given commit.                                                 |
+
+For **"refresh against remote"** semantics, apps use the standard `perspective-sync.sync()` capability — call `perspective.pullLinks(uuid)` or `perspective.sync(uuid)` through the AD4M client. The Language routes that call through the same JSON-API pull as the background timer and returns the resulting diff. No separate interaction needed.
 
 ---
 
@@ -180,15 +201,19 @@ pnpm build      # → build/bundle.js (~624KB, includes isomorphic-git)
 │   ├── fs-adapter.ts          # isomorphic-git fs over storage KV
 │   ├── http-transport.ts      # iso-git HttpClient over httpFetch (binary-blocked)
 │   ├── git.ts                 # iso-git wrappers (init, commit, log, diff, tree walk)
-│   ├── store.ts               # In-memory link cache + indexes
+│   ├── providers/github.ts    # GitHub JSON REST API client
+│   ├── remote-sync.ts         # chained-setTimeout pull loop + pullOnce
+│   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag
 │   ├── queries.ts             # link-pattern + git-history + git-state-at + git-blame
 │   ├── interactions.ts        # flush, revert-to, tag
-│   └── operations.ts          # commit, sync, render, currentRevision, boot
+│   └── operations.ts          # commit, sync (pull-routed), render, currentRevision, boot
 ├── tests/
 │   ├── encoding.test.ts
 │   ├── fs-adapter.test.ts
 │   ├── git-ops.test.ts
+│   ├── github-provider.test.ts
 │   ├── operations.test.ts
+│   ├── remote-sync.test.ts
 │   └── store.test.ts
 └── build/bundle.js            # esbuild output
 ```
