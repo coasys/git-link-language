@@ -51,6 +51,7 @@ import {
     startRemoteSync,
     type RemoteSyncHandle,
 } from "./src/remote-sync.js";
+import { parseMergePolicy, type MergePolicy } from "./src/merge.js";
 import type { PerspectiveDiff } from "./src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -75,10 +76,10 @@ const PUSH_DEBOUNCE_MS = "5000";
 //!@ad4m-template-variable
 const PULL_INTERVAL_MS = "60000";
 
-// MERGE_POLICY and PUSH_DEBOUNCE_MS are captured for the push path
-// that lands in a follow-up. v1 of the pull loop reads REMOTE_URL,
-// AUTH_TOKEN, DEFAULT_BRANCH, and PULL_INTERVAL_MS.
-void MERGE_POLICY;
+// MERGE_POLICY resolves concurrent add-vs-remove of the same link hash
+// during divergent-history convergence (see src/merge.ts). It is parsed
+// once at init and threaded into every pull. PUSH_DEBOUNCE_MS is reserved
+// for the write-back path.
 void PUSH_DEBOUNCE_MS;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ let myDid: string = "";
 let fs: GitFs | null = null;
 let remoteProvider: GitHubProvider | null = null;
 let remoteSyncHandle: RemoteSyncHandle | null = null;
+let mergePolicy: MergePolicy = "add-wins";
 
 function getFs(): GitFs {
     if (!fs) {
@@ -115,6 +117,7 @@ export async function init(): Promise<void> {
     initSigning(new DenoSigningAdapter());
     store.initStore(hash);
     myDid = agentDid();
+    mergePolicy = parseMergePolicy(MERGE_POLICY);
     fs = createFsAdapter(getStorage());
     await ops.boot({ fs, defaultBranch: DEFAULT_BRANCH });
 
@@ -135,6 +138,7 @@ export async function init(): Promise<void> {
             intervalMs,
             fs: getFs(),
             agentDid: myDid,
+            mergePolicy,
         });
     }
 }
@@ -158,6 +162,7 @@ function buildPullStrategy(): (() => Promise<PerspectiveDiff>) | null {
             intervalMs: 0,
             fs: targetFs,
             agentDid: did,
+            mergePolicy,
         });
 }
 
