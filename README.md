@@ -13,7 +13,6 @@ Built with the modern [ALDK](https://github.com/coasys/ad4m/tree/dev/ad4m-ldk) (
 - **One commit per `PerspectiveDiff`.** Additions write `links/<hash>.json` files in the working tree; removals delete them; both are staged and committed in a single Git commit signed under a DID-derived committer identity.
 - **Full local history.** Custom `git-history`, `git-state-at`, and `git-blame` query kinds expose the commit DAG, render the Perspective as it existed at any past SHA, and locate the commit that introduced a given link.
 - **Fast `link-pattern` queries** against an in-memory cache that mirrors the current `links/` tree.
-- **History-preserving revert.** The `revert-to` interaction computes the forward diff that takes current state back to a past state and commits it as a new commit — never destructively rewinds.
 - **Self-contained.** No external daemon, no native dependency. The bundle includes `isomorphic-git` and runs anywhere AD4M does.
 
 ---
@@ -28,15 +27,11 @@ index.ts
     │   ├── sync()                                 │
     │   ├── render()                               │
     │   └── currentRevision()                      │
-    ├── perspective-query    → src/queries.ts ─────┤
-    │   ├── link-pattern     (filter cache)        │
-    │   ├── git-history      (walk commit DAG)     │  uses
-    │   ├── git-state-at     (read tree at SHA)    │  src/git.ts (isomorphic-git wrappers)
-    │   └── git-blame        (find introducing commit) │
-    └── interactions          → src/interactions.ts ─┤
-        ├── flush             (push, follow-up PR)  │
-        ├── revert-to         (forward inverse)     │
-        └── tag                                     │
+    └── perspective-query    → src/queries.ts ─────┤
+        ├── link-pattern     (filter cache)        │
+        ├── git-history      (walk commit DAG)     │  uses
+        ├── git-state-at     (read tree at SHA)    │  src/git.ts (isomorphic-git wrappers)
+        └── git-blame        (find introducing commit) │
                                                     │
 src/providers/github.ts ← JSON REST client for GitHub (refs/commits/trees/blobs)
 src/remote-sync.ts ← chained-setTimeout pull loop (default 60 s, ETag-conditional)
@@ -159,18 +154,6 @@ For a specific link hash, locate the commit that introduced it (and the commit t
 
 ---
 
-## Interactions
-
-| Name        | Parameters         | Effect                                                                                |
-|-------------|--------------------|---------------------------------------------------------------------------------------|
-| `flush`     | none               | Force a push (push path is the follow-up; no-op in v1).                               |
-| `revert-to` | `sha: string`      | Compute the forward inverse and commit it. Preserves history.                         |
-| `tag`       | `name`, `sha`      | Create a Git tag at the given commit.                                                 |
-
-For **"refresh against remote"** semantics, apps use the standard `perspective-sync.sync()` capability — call `perspective.pullLinks(uuid)` or `perspective.sync(uuid)` through the AD4M client. The Language routes that call through the same JSON-API pull as the background timer and returns the resulting diff. No separate interaction needed.
-
----
-
 ## Prerequisites
 
 - **[Deno](https://deno.land/)** (v1.32+) — used by the build script.
@@ -205,7 +188,6 @@ pnpm build      # → build/bundle.js (~624KB, includes isomorphic-git)
 │   ├── remote-sync.ts         # chained-setTimeout pull loop + pullOnce
 │   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag
 │   ├── queries.ts             # link-pattern + git-history + git-state-at + git-blame
-│   ├── interactions.ts        # flush, revert-to, tag
 │   └── operations.ts          # commit, sync (pull-routed), render, currentRevision, boot
 ├── tests/
 │   ├── encoding.test.ts
