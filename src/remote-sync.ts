@@ -44,9 +44,9 @@
 import * as gitops from "./git.js";
 import * as store from "./store.js";
 import type { GitFs } from "./fs-adapter.js";
-import { deserializeLink, linkHashFromPath } from "./encoding.js";
+import { deserializeLink, linkHashFromPath, serializeLink } from "./encoding.js";
 import type { LinkExpression, PerspectiveDiff, SHA } from "./types.js";
-import type { CommitResponse, GitHubProvider } from "./providers/github.js";
+import type { CommitResponse, GitProvider } from "./providers/types.js";
 import { getRuntime } from "./adapters.js";
 import {
     orSetMerge,
@@ -93,7 +93,7 @@ function setMirror(remoteSha: string, localOid: SHA): void {
 // ---------------------------------------------------------------------------
 
 export interface RemoteSyncOpts {
-    provider: GitHubProvider;
+    provider: GitProvider;
     branch: string;
     intervalMs: number;
     fs: GitFs;
@@ -160,7 +160,7 @@ function diffLinkSets(
  * re-request a commit.
  */
 async function collectMissingRemoteCommits(
-    provider: GitHubProvider,
+    provider: GitProvider,
     headSha: string,
 ): Promise<CommitResponse[]> {
     const commitCache = new Map<string, CommitResponse>();
@@ -261,7 +261,7 @@ function lowerBound(sorted: string[], value: string): number {
  * whole pull so shared blobs are fetched once.
  */
 async function fetchRemoteLinkSet(
-    provider: GitHubProvider,
+    provider: GitProvider,
     commit: CommitResponse,
     blobCache: Map<string, string>,
 ): Promise<Map<string, string>> {
@@ -532,6 +532,262 @@ async function rebuildCacheFromHead(fs: GitFs): Promise<void> {
         }
     }
     store.setRevision(head);
+}
+
+// ---------------------------------------------------------------------------
+// Push driver (the mirror image of pull)
+// ---------------------------------------------------------------------------
+
+/**
+ * The result of a push attempt.
+ *
+ *   - `pushed`      — how many local commits were newly POSTed to the remote
+ *                     (0 when the remote was already up to date).
+ *   - `ok`          — whether the remote ref now points at the local head.
+ *   - `unsupported` — true when the provider cannot push (`canPush=false`);
+ *                     the caller treats this as a no-op, not a failure.
+ */
+export interface PushResult {
+    ok: boolean;
+    pushed: number;
+    unsupported?: boolean;
+}
+
+/**
+ * Enumerate the local OIDs already known to exist on the remote: the values
+ * of the remote→local mirror map (each is a local twin of a remote commit),
+ * i.e. the boundary where a local back-walk can stop because the remote
+ * already has that commit.
+ */
+function mirroredLocalOids(): Set<SHA> {
+    const out = new Set<SHA>();
+    for (const key of store.listStorageKeys(MIRROR_PREFIX)) {
+        const oid = store.getStorageRaw(key);
+        if (oid) out.add(oid);
+    }
+    return out;
+}
+
+/**
+ * Collect the local commits reachable from `head` that the remote does not
+ * yet have, ordered oldest → newest (parents before children). The walk
+ * stops at any commit already present on the remote (a mirror twin) and at
+ * roots.
+ */
+async function collectUnpushedLocalCommits(
+    fs: GitFs,
+    head: SHA,
+    onRemote: Set<SHA>,
+): Promise<SHA[]> {
+    const collected = new Map<SHA, gitops.RawCommitObject>();
+    const seen = new Set<SHA>();
+    const queue: SHA[] = [head];
+    while (queue.length > 0) {
+        const oid = queue.shift() as SHA;
+        if (seen.has(oid)) continue;
+        seen.add(oid);
+        if (onRemote.has(oid)) continue; // already on the remote — boundary
+        const commit = await gitops.readCommitObject(fs, oid);
+        if (!commit) continue;
+        collected.set(oid, commit);
+        for (const p of commit.parent) {
+            if (!seen.has(p)) queue.push(p);
+        }
+    }
+    return topoOrderOids(collected);
+}
+
+/**
+ * Topological sort of a local commit map so each commit appears after its
+ * parents present in the map (roots / already-pushed parents are treated as
+ * satisfied). Deterministic: ties broken lexicographically.
+ */
+function topoOrderOids(commits: Map<SHA, gitops.RawCommitObject>): SHA[] {
+    const indegree = new Map<SHA, number>();
+    const children = new Map<SHA, SHA[]>();
+    for (const oid of commits.keys()) indegree.set(oid, 0);
+    for (const [oid, commit] of commits) {
+        for (const p of commit.parent) {
+            if (!commits.has(p)) continue;
+            indegree.set(oid, (indegree.get(oid) ?? 0) + 1);
+            const arr = children.get(p) ?? [];
+            arr.push(oid);
+            children.set(p, arr);
+        }
+    }
+    const ready = [...indegree.entries()]
+        .filter(([, d]) => d === 0)
+        .map(([oid]) => oid)
+        .sort();
+    const ordered: SHA[] = [];
+    while (ready.length > 0) {
+        const oid = ready.shift() as SHA;
+        ordered.push(oid);
+        for (const child of (children.get(oid) ?? []).sort()) {
+            const d = (indegree.get(child) ?? 0) - 1;
+            indegree.set(child, d);
+            if (d === 0) ready.splice(lowerBound(ready, child), 0, child);
+        }
+    }
+    return ordered;
+}
+
+/**
+ * POST one local commit's objects to the remote in dependency order
+ * (blobs → tree → commit) and assert every returned SHA equals the local
+ * OID. Because Git object hashing is deterministic over content, a
+ * byte-identical POST reproduces the local OID; a mismatch means the remote
+ * canonicalised the object differently and is a hard error (never a silent
+ * divergence). Returns nothing — success is the SHA-equality assertions.
+ */
+async function pushLocalCommit(
+    fs: GitFs,
+    provider: GitProvider,
+    oid: SHA,
+    commit: gitops.RawCommitObject,
+): Promise<void> {
+    // 1. Blobs: the serialised content of every link at this commit. POST
+    //    each and assert the remote reproduces the local blob OID.
+    const linkBlobs = await gitops.linkBlobOidsAt(fs, oid);
+    const treeEntries: Array<{
+        path: string;
+        mode: string;
+        type: "blob";
+        sha: string;
+    }> = [];
+    for (const [hash, localBlobOid] of linkBlobs) {
+        const raw = await gitops.readLinkAt(fs, oid, hash);
+        if (raw === null) {
+            throw new Error(
+                `push: link ${hash} present in tree of ${oid} but unreadable`,
+            );
+        }
+        // Re-serialise through the same path the local blob was written with
+        // so the posted bytes are byte-identical to the local object.
+        const content = serializeLink(deserializeLink(raw));
+        const { sha } = await provider.createBlob(content);
+        assertSha(sha, localBlobOid, "blob", hash);
+        treeEntries.push({
+            path: `links/${hash}.json`,
+            mode: "100644",
+            type: "blob",
+            sha,
+        });
+    }
+
+    // 2. Tree: rebuild the root tree from the (remote-confirmed) blob SHAs
+    //    and assert it reproduces the local tree OID.
+    const { sha: treeSha } = await provider.createTree(treeEntries);
+    assertSha(treeSha, commit.tree, "tree", oid);
+
+    // 3. Commit: POST with the remote parent SHAs (== local parent OIDs,
+    //    which are already on the remote by topological ordering) and assert
+    //    it reproduces the local commit OID. Author *and* committer are sent
+    //    from the local object's own fields so the reconstructed commit is
+    //    byte-identical. Local commits are pinned to UTC (see git.commit /
+    //    the pull+merge paths), so an ISO date with a `Z` suffix reproduces
+    //    the exact `<timestamp> +0000` line Git hashed.
+    const { sha: commitSha } = await provider.createCommit({
+        tree: treeSha,
+        parents: commit.parent,
+        message: commit.message,
+        author: {
+            name: commit.author.name,
+            email: commit.author.email,
+            date: new Date(commit.author.timestamp * 1000).toISOString(),
+        },
+        committer: {
+            name: commit.committer.name,
+            email: commit.committer.email,
+            date: new Date(commit.committer.timestamp * 1000).toISOString(),
+        },
+    });
+    assertSha(commitSha, oid, "commit", oid);
+}
+
+function assertSha(
+    returned: string,
+    expected: string,
+    kind: string,
+    context: string,
+): void {
+    if (returned !== expected) {
+        throw new Error(
+            `push: remote ${kind} SHA ${returned} != local OID ${expected} ` +
+                `(${context}); the remote canonicalised the object differently`,
+        );
+    }
+}
+
+/**
+ * Push local commits to the remote — the mirror image of {@link pullOnce}.
+ *
+ *   1. Compute the boundary the remote already has (mirror twins) and walk
+ *      local HEAD back to it, collecting unpushed commits oldest → newest.
+ *   2. POST each commit's objects bottom-up (blobs → tree → commit),
+ *      asserting SHA-equality, and record each pushed commit as now on the
+ *      remote (so subsequent syncs treat it as a boundary).
+ *   3. `updateRef(branch, localHead)`. On a non-fast-forward rejection (the
+ *      remote moved under us), run {@link pullOnce} to converge, then retry
+ *      the push **once**.
+ *
+ * Fault-tolerant and idempotent: an unsupported provider is a no-op; a
+ * fully-mirrored local head advances only the ref (or nothing).
+ */
+export async function pushOnce(
+    opts: RemoteSyncOpts & { _retry?: boolean },
+): Promise<PushResult> {
+    const { fs, provider, branch } = opts;
+    if (!provider.canPush) {
+        return { ok: false, pushed: 0, unsupported: true };
+    }
+
+    const localHead = await gitops.currentHead(fs);
+    if (localHead === null) {
+        // Nothing committed locally yet.
+        return { ok: true, pushed: 0 };
+    }
+
+    // -- 1. Which local commits does the remote lack? --------------------
+    const onRemote = mirroredLocalOids();
+    // The tracked remote head's mirror is on the remote too; include it.
+    const trackedRemote = getRemoteSha();
+    if (trackedRemote) {
+        const twin = getMirror(trackedRemote);
+        if (twin) onRemote.add(twin);
+    }
+    // If the local head is already known-on-remote, only the ref may need to
+    // move (it already does, by definition of tracked sha == head mirror).
+    const unpushed = await collectUnpushedLocalCommits(fs, localHead, onRemote);
+
+    // -- 2. POST each missing commit bottom-up --------------------------
+    for (const oid of unpushed) {
+        const commit = await gitops.readCommitObject(fs, oid);
+        if (!commit) continue;
+        await pushLocalCommit(fs, provider, oid, commit);
+        // Record the commit as present on the remote: its own SHA is the
+        // remote SHA (deterministic hashing), so it becomes a boundary and a
+        // pull will recognise it as already-mirrored.
+        setMirror(oid, oid);
+    }
+
+    // -- 3. Move the remote ref -----------------------------------------
+    const refResult = await provider.updateRef(branch, localHead);
+    if (refResult.ok) {
+        setRemoteSha(localHead);
+        return { ok: true, pushed: unpushed.length };
+    }
+
+    if (refResult.notFastForward && !opts._retry) {
+        // The remote advanced under us. Converge it locally, then retry the
+        // push once against the new (merged) local head.
+        await pullOnce(opts);
+        return await pushOnce({ ...opts, _retry: true });
+    }
+
+    // Non-fast-forward on the retry, or another ref failure: leave tracking
+    // untouched so the next sync re-attempts. Not fatal.
+    return { ok: false, pushed: unpushed.length };
 }
 
 /**

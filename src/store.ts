@@ -208,6 +208,10 @@ export function setStorageRaw(key: string, value: string): void {
     getStorage().put(key, value);
 }
 
+export function listStorageKeys(prefix: string): string[] {
+    return getStorage().listKeys(prefix);
+}
+
 // ---------------------------------------------------------------------------
 // Revision tracking
 // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ An AD4M Link Language that backs Perspectives with a real Git repository. Every 
 
 Built with the modern [ALDK](https://github.com/coasys/ad4m/tree/dev/ad4m-ldk) (`@coasys/ad4m-ldk`) pattern.
 
-**Status:** v0.1. Bidirectional convergence: the pull path walks remote commit ancestry and OR-Set-merges divergent histories into a genuine two-parent merge commit. Push (write-back to the remote) is the remaining follow-up.
+**Status:** v0.1. Bidirectional sync: the pull path walks remote commit ancestry and OR-Set-merges divergent histories into a genuine two-parent merge commit, and — for providers that expose a JSON write API — the **push path mirrors local commits back to the configured remote** (trailing-edge debounced, non-fast-forward → pull + merge + retry). The remote is chosen from the `REMOTE_KIND × REMOTE_URL` instance parameters: **GitHub** (read + write) and **Radicle** (read-convergent; push is out-of-band via the local `rad` node) are supported today.
 
 The commit DAG **is** the convergence substrate this Language exposes to AD4M — the `perspective-sync` revision is the HEAD commit SHA (a content hash), and convergence is a DAG operation (ancestry walk + merge), not a snapshot fetch-and-replace. See [Diff-DAG convergence](#diff-dag-convergence).
 
@@ -14,6 +14,8 @@ The commit DAG **is** the convergence substrate this Language exposes to AD4M �
 
 - **One commit per `PerspectiveDiff`.** Additions write `links/<hash>.json` files in the working tree; removals delete them; both are staged and committed in a single Git commit signed under a DID-derived committer identity.
 - **Convergent remote sync.** The pull path walks the remote commit chain back to the last commit it already mirrored, reconstructs each missing commit locally as a real Git object (preserving remote author/message/timestamp), then fast-forwards or — on genuine divergence — writes an **OR-Set merge commit** keyed by link hash. `MERGE_POLICY` resolves a concurrent add-vs-remove of the same hash.
+- **Push write-back (capable providers).** After a local commit, the push path walks HEAD back to the boundary the remote already holds and POSTs each missing commit's objects bottom-up (blobs → tree → commit) via the provider's JSON write API, then advances the ref. Because Git object hashing is deterministic over content, a byte-identical POST reproduces the local OID — every write asserts `returnedSha === localOid`, so a push is the exact mirror image of a pull. A non-fast-forward ref rejection triggers a pull + OR-Set merge and one retry.
+- **Pluggable providers.** `REMOTE_KIND` (`auto` | `github` | `radicle`) selects the backing forge; `auto` infers it from `REMOTE_URL`. GitHub is read + write; Radicle is read-convergent (`radicle-httpd` exposes no JSON write API, so pushes go out-of-band through the local `rad` node — an honest capability boundary, `canPush = false`).
 - **Full local history.** Custom `git-history`, `git-state-at`, and `git-blame` query kinds expose the commit DAG, render the Perspective as it existed at any past SHA, and locate the commit that introduced a given link.
 - **Fast `link-pattern` queries** against an in-memory cache that mirrors the current `links/` tree. The cache is a *derived* view — HEAD is the source of truth and the cache is rebuilt from it after every convergence.
 - **Self-contained.** No external daemon, no native dependency. The bundle includes `isomorphic-git` and runs anywhere AD4M does.
@@ -36,8 +38,11 @@ index.ts
         ├── git-state-at     (read tree at SHA)    │  src/git.ts (isomorphic-git wrappers)
         └── git-blame        (find introducing commit) │
                                                     │
-src/providers/github.ts ← JSON REST client for GitHub (refs/commits/trees/blobs)
-src/remote-sync.ts ← ancestry-walk pull + mirror + fast-forward/OR-Set-merge; chained-setTimeout loop (default 60 s, ETag-conditional)
+src/providers/types.ts  ← GitProvider interface (reads + writes + canPush)
+src/providers/select.ts ← REMOTE_KIND × REMOTE_URL → provider (explicit kind wins; auto infers from URL)
+src/providers/github.ts ← JSON REST client for GitHub — reads + writes (refs/commits/trees/blobs), canPush = true
+src/providers/radicle.ts ← radicle-httpd JSON reads (project doc / commits / tree / blob); writes throw (canPush = false)
+src/remote-sync.ts ← ancestry-walk pull + mirror + fast-forward/OR-Set-merge AND mirror-image push (blobs→tree→commit, SHA-equality asserted, NFF→pull+retry); chained-setTimeout loop (default 60 s, ETag-conditional)
 src/merge.ts      ← pure OR-Set fold (adds ∪ − tombstones) + MERGE_POLICY conflict resolution
 src/store.ts      ← in-memory cache (links, indexes, revision, remote-sha, etag, remote→local mirror map)
 src/fs-adapter.ts ← isomorphic-git fs over storage KV (base64-encoded binary)
@@ -64,13 +69,15 @@ Git smart-protocol responses are binary (pack files). The executor's `httpFetch`
 
 The Language closes the loop by talking to Git provider **JSON REST APIs** instead — refs, commits, trees, and blobs (base64-encoded content) all round-trip cleanly through `httpFetch` because they are valid UTF-8 on the wire.
 
+**Provider selection.** `REMOTE_KIND` picks the backing forge: an explicit `github` / `radicle` wins outright (and selection is null if `REMOTE_URL` does not parse for that kind — no silent fallback); the default `auto` probes each provider's URL parser in turn. An empty / `<to-be-filled>` `REMOTE_URL` means no remote (local-only). See `src/providers/select.ts`.
+
 **v1 provider support:**
 
-| Provider | Pull | Push | Notes |
-|---|---|---|---|
-| GitHub (`github.com/<o>/<r>`) | ✅ Automatic, 60 s default | ⚠️ Follow-up | Uses `/repos/<o>/<r>/git/{refs,commits,trees,blobs}` |
-| GitLab / Gitea | Planned | ⚠️ Follow-up | Same shape, different URL prefix |
-| Self-hosted Git / Radicle web seed | Manual fallback | ⚠️ Follow-up | Configure as opaque remote; pull via external `git pull` + AD4M `sync()` |
+| Provider | `REMOTE_KIND` | Pull | Push | Notes |
+|---|---|---|---|---|
+| GitHub (`github.com/<o>/<r>`) | `github` / `auto` | ✅ Automatic, 60 s default | ✅ Debounced write-back | `/repos/<o>/<r>/git/{refs,commits,trees,blobs}`; `canPush = true` |
+| Radicle (RID, `radicle-httpd`, or explorer URL) | `radicle` / `auto` | ✅ Read-convergent | ⛔ Out-of-band | `radicle-httpd` `/api/v1` reads only; no JSON write API, so push is via the local `rad` node. `canPush = false` |
+| GitLab / Gitea | (planned) | Planned | Planned | Same JSON-plumbing shape, different URL prefix |
 
 **How the pull loop works:**
 
@@ -80,9 +87,11 @@ The Language closes the loop by talking to Git provider **JSON REST APIs** inste
 
 **On-demand mode (`PULL_INTERVAL_MS=0`):** the background timer is disabled, but the standard `perspective-sync.sync()` capability still routes through the same pull. Apps trigger refreshes by calling the AD4M `perspective.pullLinks` / `perspective.sync()` RPC — useful when polling is wasteful and the UI knows when state should change (e.g. after a user "refresh" action, or driven by an external signal).
 
-**Push** (after a local `addLink`) is the follow-up: POST `/git/blobs` (base64), POST `/git/trees`, POST `/git/commits`, PATCH `/git/refs/heads/<branch>`. Same plumbing, opposite direction. Wired in a subsequent PR. `PUSH_DEBOUNCE_MS` is reserved for it.
+**How the push path works (GitHub):** after a local commit advances HEAD, a **trailing-edge debounced** push (default `PUSH_DEBOUNCE_MS` = 5 s — a burst of `addLink`s coalesces into one push fired after the last) walks HEAD back to the boundary the remote already holds (tracked via the remote→local mirror map) and POSTs each missing commit oldest-first: `POST /git/blobs` (UTF-8), `POST /git/trees`, `POST /git/commits`, then `PATCH /git/refs/heads/<branch>` (creating the ref with `POST /git/refs` if absent). Every write asserts the SHA GitHub returns equals the local OID; a mismatch is a hard error (never a silent divergence). If the ref PATCH is rejected as a non-fast-forward (the remote moved under us), the push runs `pullOnce()` to OR-Set-merge, then retries **once**. Local commits are pinned to a **UTC** author/committer so the OID is reproducible off-box — the ISO date POSTed to GitHub reconstructs the exact bytes Git hashed. Push failures are swallowed (logged) so they never break the local commit path; the next commit or a manual `sync()` re-attempts.
 
-**Local-only fallback:** if `REMOTE_URL` is unset or points at an unsupported host (raw self-hosted Git, Radicle web seeds), the Language runs in local-only mode. `sync()` still detects external HEAD movement and emits the diff for two-peer setups that share storage out-of-band.
+**Radicle push is out-of-band.** `radicle-httpd` exposes only a read API (`/api/v1`) — there is no JSON endpoint to create blobs/trees/commits or move a ref (the smart-protocol write path is unreachable through the executor's UTF-8-decoding `httpFetch`, and the sandbox cannot reach a local node socket). The Radicle provider therefore sets `canPush = false` and its write methods throw a clear, documented error; the Language skips auto-push and remains a read-convergent replica. Publishing changes back happens through the operator's local `rad` node (`rad push` / `git push rad`), after which every other replica converges by the normal pull path. This is an honest capability boundary, verified against the `radicle-httpd` route table — **not** a stub.
+
+**Local-only fallback:** if `REMOTE_URL` is unset / `<to-be-filled>` or points at an unrecognised host, the Language runs in local-only mode. `sync()` still detects external HEAD movement and emits the diff for two-peer setups that share storage out-of-band.
 
 ---
 
@@ -127,32 +136,34 @@ Cross-network convergence between two *live* AD4M nodes cannot be exercised in t
 
 ```typescript
 //!@ad4m-template-variable
-const REMOTE_URL = "<to-be-filled>";        // e.g. "https://github.com/me/perspective.git"
+const REMOTE_URL = "<to-be-filled>";        // GitHub repo URL, or a Radicle RID / radicle-httpd / explorer URL
+
+//!@ad4m-template-variable
+const REMOTE_KIND = "auto";                  // auto | github | radicle — auto infers the provider from REMOTE_URL
 
 //!@ad4m-template-variable
 const DEFAULT_BRANCH = "main";
 
 //!@ad4m-template-variable
-const AUTH_TOKEN = "";                       // GitHub PAT, sent as "Authorization: token <pat>"
-
-//!@ad4m-template-variable
-const PULL_INTERVAL_MS = "60000";            // pull cadence; 0 or unset disables the loop
+const AUTH_TOKEN = "";                       // GitHub PAT ("Authorization: token <pat>") / Radicle session ("Bearer <token>")
 
 //!@ad4m-template-variable
 const MERGE_POLICY = "add-wins";             // add-wins | remove-wins — resolves concurrent add-vs-remove of the same link hash during divergent-history merge
 
 //!@ad4m-template-variable
-const PUSH_DEBOUNCE_MS = "5000";             // push-side; reserved for the write-back follow-up
+const PUSH_DEBOUNCE_MS = "5000";             // trailing-edge push debounce; coalesces a burst of commits into one push (GitHub only)
+
+//!@ad4m-template-variable
+const PULL_INTERVAL_MS = "60000";            // pull cadence; 0 or unset disables the loop (manual sync() still works)
 ```
 
-**Active in v1:**
+**All active in v1:**
 
-- `REMOTE_URL`, `AUTH_TOKEN`, `PULL_INTERVAL_MS`, `DEFAULT_BRANCH` — drive the JSON-API pull loop.
-- `MERGE_POLICY` — parsed once at init and threaded into every pull; decides the concurrent add-vs-remove conflict during divergent-history convergence (see [Diff-DAG convergence](#diff-dag-convergence)).
-
-**Captured for the push follow-up:**
-
-- `PUSH_DEBOUNCE_MS`.
+- `REMOTE_URL` + `REMOTE_KIND` — select the provider (`src/providers/select.ts`); an empty / `<to-be-filled>` URL means local-only.
+- `AUTH_TOKEN` — bearer/PAT for the chosen provider's reads (and GitHub writes).
+- `PULL_INTERVAL_MS`, `DEFAULT_BRANCH` — drive the JSON-API pull loop.
+- `MERGE_POLICY` — parsed once at init and threaded into every pull (and the push-retry merge); decides the concurrent add-vs-remove conflict during divergent-history convergence (see [Diff-DAG convergence](#diff-dag-convergence)).
+- `PUSH_DEBOUNCE_MS` — trailing-edge debounce for the GitHub write-back; a no-op when the provider cannot push (Radicle) or the debounce is ≤ 0.
 
 ---
 
@@ -206,9 +217,9 @@ For a specific link hash, locate the commit that introduced it (and the commit t
 
 ```bash
 NODE_ENV=development pnpm install
-pnpm test       # 133 tests across 54 suites
+pnpm test       # 179 tests across 72 suites
 pnpm typecheck  # tsc --noEmit
-pnpm build      # → build/bundle.js (~632KB, includes isomorphic-git)
+pnpm build      # → build/bundle.js (~647KB, includes isomorphic-git)
 ```
 
 ## Project structure
@@ -227,8 +238,12 @@ pnpm build      # → build/bundle.js (~632KB, includes isomorphic-git)
 │   ├── http-transport.ts      # iso-git HttpClient over httpFetch (binary-blocked)
 │   ├── git.ts                 # iso-git wrappers (init, commit, log, diff, tree walk, low-level object plumbing, branch op-log)
 │   ├── merge.ts               # pure OR-Set fold + MERGE_POLICY conflict resolution
-│   ├── providers/github.ts    # GitHub JSON REST API client
-│   ├── remote-sync.ts         # ancestry-walk pull + mirror + fast-forward/OR-Set-merge; setTimeout loop + pullOnce
+│   ├── providers/
+│   │   ├── types.ts           # GitProvider interface (reads + writes + canPush)
+│   │   ├── select.ts          # REMOTE_KIND × REMOTE_URL → provider
+│   │   ├── github.ts          # GitHub JSON REST client (reads + writes)
+│   │   └── radicle.ts         # radicle-httpd JSON reads; writes throw (canPush = false)
+│   ├── remote-sync.ts         # ancestry-walk pull + mirror + fast-forward/OR-Set-merge + mirror-image push; setTimeout loop + pullOnce/pushOnce
 │   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag + mirror map
 │   ├── queries.ts             # link-pattern + git-history + git-state-at + git-blame
 │   └── operations.ts          # commit, sync (pull-routed), render, currentRevision, boot
@@ -237,7 +252,10 @@ pnpm build      # → build/bundle.js (~632KB, includes isomorphic-git)
 │   ├── encoding.test.ts
 │   ├── fs-adapter.test.ts
 │   ├── git-ops.test.ts
-│   ├── github-provider.test.ts
+│   ├── github-provider.test.ts   # GitHub read endpoints
+│   ├── github-push.test.ts       # GitHub write payloads + pushOnce end-to-end (real iso-git "remote")
+│   ├── provider-selection.test.ts # selectProvider over REMOTE_KIND × REMOTE_URL
+│   ├── radicle-provider.test.ts  # parseRadicleUrl + radicle-httpd reads + write capability boundary
 │   ├── merge.test.ts          # pure OR-Set semantics (order-independence, tombstones, policy)
 │   ├── convergence.test.ts    # end-to-end diff-DAG: ancestry walk, divergent merge, fold
 │   ├── operations.test.ts

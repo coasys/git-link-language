@@ -162,11 +162,24 @@ export async function commit(
             if (!/not.*staged|not found in the index/i.test(message)) throw err;
         }
     }
+    // Pin the author/committer to a UTC timestamp so the commit OID is
+    // reproducible off-box. isomorphic-git otherwise fills the timezone from
+    // the local machine, which (a) makes the OID depend on where the executor
+    // runs and (b) cannot be reconstructed from the UTC ISO date the push path
+    // POSTs — breaking the `returnedSha === localOid` invariant that lets a
+    // commit be mirrored to a remote. Author == committer, matching how the
+    // pull/merge paths reconstruct commits (see remote-sync.ts).
+    const identity = {
+        name: opts.author.name,
+        email: opts.author.email,
+        timestamp: opts.author.timestamp ?? Math.floor(Date.now() / 1000),
+        timezoneOffset: 0,
+    };
     const sha = await git.commit({
         fs,
         dir: REPO_DIR,
-        author: opts.author,
-        committer: opts.author,
+        author: identity,
+        committer: identity,
         message:
             opts.message ??
             `diff: +${opts.additions.length} -${opts.removals.length}`,

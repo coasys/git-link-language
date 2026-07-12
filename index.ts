@@ -45,9 +45,11 @@ import * as ops from "./src/operations.js";
 import * as queries from "./src/queries.js";
 import * as store from "./src/store.js";
 import { buildInteractions } from "./src/interactions.js";
-import { GitHubProvider, parseGitHubUrl } from "./src/providers/github.js";
+import type { GitProvider } from "./src/providers/types.js";
+import { selectProvider } from "./src/providers/select.js";
 import {
     pullOnce,
+    pushOnce,
     startRemoteSync,
     type RemoteSyncHandle,
 } from "./src/remote-sync.js";
@@ -60,6 +62,9 @@ import type { PerspectiveDiff } from "./src/types.js";
 
 //!@ad4m-template-variable
 const REMOTE_URL = "<to-be-filled>";
+
+//!@ad4m-template-variable
+const REMOTE_KIND = "auto";
 
 //!@ad4m-template-variable
 const DEFAULT_BRANCH = "main";
@@ -76,11 +81,12 @@ const PUSH_DEBOUNCE_MS = "5000";
 //!@ad4m-template-variable
 const PULL_INTERVAL_MS = "60000";
 
-// MERGE_POLICY resolves concurrent add-vs-remove of the same link hash
-// during divergent-history convergence (see src/merge.ts). It is parsed
-// once at init and threaded into every pull. PUSH_DEBOUNCE_MS is reserved
-// for the write-back path.
-void PUSH_DEBOUNCE_MS;
+// REMOTE_KIND selects the provider ("auto" | "github" | "radicle"); "auto"
+// infers it from REMOTE_URL (see detectProvider). MERGE_POLICY resolves
+// concurrent add-vs-remove of the same link hash during divergent-history
+// convergence (see src/merge.ts); it is parsed once at init and threaded
+// into every pull. PUSH_DEBOUNCE_MS coalesces bursty local commits into one
+// trailing-edge push (see schedulePush).
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -88,9 +94,14 @@ void PUSH_DEBOUNCE_MS;
 
 let myDid: string = "";
 let fs: GitFs | null = null;
-let remoteProvider: GitHubProvider | null = null;
+let remoteProvider: GitProvider | null = null;
 let remoteSyncHandle: RemoteSyncHandle | null = null;
 let mergePolicy: MergePolicy = "add-wins";
+
+// Trailing-edge push debounce: a burst of local commits schedules a single
+// push PUSH_DEBOUNCE_MS after the last one, so we do not POST once per link.
+let pushTimer: ReturnType<typeof setTimeout> | null = null;
+let pushInFlight: Promise<void> | null = null;
 
 function getFs(): GitFs {
     if (!fs) {
@@ -143,11 +154,59 @@ export async function init(): Promise<void> {
     }
 }
 
-function detectProvider(): GitHubProvider | null {
-    if (!REMOTE_URL || REMOTE_URL === "<to-be-filled>") return null;
-    const ghRef = parseGitHubUrl(REMOTE_URL);
-    if (!ghRef) return null;
-    return new GitHubProvider(getTransport(), ghRef, AUTH_TOKEN);
+/**
+ * Resolve the configured remote (`REMOTE_KIND × REMOTE_URL`) into a
+ * provider, or null when no supported remote is set. See
+ * {@link selectProvider} for the selection rules.
+ */
+function detectProvider(): GitProvider | null {
+    return selectProvider({
+        url: REMOTE_URL,
+        kind: REMOTE_KIND,
+        transport: getTransport(),
+        authToken: AUTH_TOKEN,
+    });
+}
+
+/**
+ * Schedule a trailing-edge debounced push. Called after each successful
+ * local commit; coalesces a burst of commits into a single push fired
+ * `PUSH_DEBOUNCE_MS` after the last one. A no-op when there is no provider,
+ * the provider cannot push, or the debounce is disabled (<= 0). Errors are
+ * swallowed so a push failure never breaks the commit path — the next
+ * commit (or a manual sync) re-attempts.
+ */
+function schedulePush(): void {
+    if (!remoteProvider || !remoteProvider.canPush || !fs) return;
+    const debounceMs = Number.parseInt(PUSH_DEBOUNCE_MS, 10);
+    const delay = Number.isFinite(debounceMs) && debounceMs > 0 ? debounceMs : 0;
+
+    if (pushTimer !== null) clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => {
+        pushTimer = null;
+        const provider = remoteProvider;
+        const targetFs = fs;
+        if (!provider || !targetFs) return;
+        pushInFlight = (async () => {
+            try {
+                await pushOnce({
+                    provider,
+                    branch: DEFAULT_BRANCH,
+                    intervalMs: 0,
+                    fs: targetFs,
+                    agentDid: myDid,
+                    mergePolicy,
+                });
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                try {
+                    console.warn(`[git-link-language] push failed: ${message}`);
+                } catch (_e) {
+                    // Never let the debounced push crash the runtime.
+                }
+            }
+        })();
+    }, delay);
 }
 
 function buildPullStrategy(): (() => Promise<PerspectiveDiff>) | null {
@@ -171,6 +230,20 @@ export async function teardown(): Promise<void> {
         remoteSyncHandle.stop();
         remoteSyncHandle = null;
     }
+    // Cancel a pending debounced push and let any in-flight push settle so a
+    // teardown mid-burst does not leak a timer or a dangling POST.
+    if (pushTimer !== null) {
+        clearTimeout(pushTimer);
+        pushTimer = null;
+    }
+    if (pushInFlight) {
+        try {
+            await pushInFlight;
+        } catch (_e) {
+            // Already logged at the push site.
+        }
+        pushInFlight = null;
+    }
     remoteProvider = null;
     myDid = "";
     fs = null;
@@ -186,11 +259,17 @@ export function interactions(_address: string) {
 export async function perspectiveCommit(
     diff: PerspectiveDiff,
 ): Promise<string> {
-    return await ops.commit({
+    const sha = await ops.commit({
         fs: getFs(),
         diff,
         authorDid: myDid,
     });
+    // Only a diff that actually changed something advances HEAD and needs a
+    // push. A no-op commit returns the existing HEAD unchanged.
+    if (diff.additions.length > 0 || diff.removals.length > 0) {
+        schedulePush();
+    }
+    return sha;
 }
 
 // ----- perspective-sync -----------------------------------------------------
@@ -246,6 +325,7 @@ export default language;
 
 export const possibleTemplateParams: string[] = [
     "REMOTE_URL",
+    "REMOTE_KIND",
     "DEFAULT_BRANCH",
     "AUTH_TOKEN",
     "MERGE_POLICY",

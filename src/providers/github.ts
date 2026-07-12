@@ -1,18 +1,34 @@
 /**
- * GitHub REST API client for the read-only sync path.
+ * GitHub REST API client implementing {@link GitProvider}.
  *
- * Why: the executor's `httpFetch` UTF-8-decodes response bodies, which
- * corrupts Git smart-protocol pack files. GitHub's REST plumbing
- * (`/git/refs`, `/git/commits`, `/git/trees`, `/git/blobs`) returns
+ * ## Why JSON REST, not the smart protocol
+ *
+ * The executor's `httpFetch` UTF-8-decodes response bodies, which would
+ * corrupt binary Git pack files, so the smart protocol is unreachable.
+ * GitHub's REST plumbing (`/git/{refs,commits,trees,blobs}`) returns
  * everything as JSON with blob content base64-encoded — every byte is
  * valid UTF-8 on the wire, so it round-trips cleanly.
  *
- * Endpoints used (all under `https://api.github.com/repos/<owner>/<repo>`):
+ * ## Read endpoints (all under `https://api.github.com/repos/<owner>/<repo>`)
  *
  *   GET /git/refs/heads/<branch>       — supports If-None-Match → 304
  *   GET /git/commits/<sha>
  *   GET /git/trees/<sha>?recursive=1
  *   GET /git/blobs/<sha>
+ *
+ * ## Write endpoints (the push path)
+ *
+ *   POST  /git/blobs      { content, encoding: "utf-8" }        → { sha }
+ *   POST  /git/trees      { tree: [{ path, mode, type, sha }] } → { sha }
+ *   POST  /git/commits    { message, tree, parents, author, committer } → { sha }
+ *   POST  /git/refs       { ref: "refs/heads/<b>", sha }        (create)
+ *   PATCH /git/refs/heads/<branch>  { sha, force }              (advance)
+ *
+ * GitHub recomputes the object SHA from the posted content, so a
+ * byte-identical POST returns the same OID the local repo computed. Each
+ * write asserts `returnedSha === localOid`. A `422` on the ref PATCH means
+ * a non-fast-forward update (the remote moved) — surfaced as
+ * `{ ok:false, notFastForward:true }` so the caller pulls + merges + retries.
  *
  * Auth is `Authorization: token <pat>` (works for classic + fine-grained
  * PATs); `Accept: application/vnd.github+json` and
@@ -20,6 +36,25 @@
  */
 
 import type { Transport } from "../adapters.js";
+import type {
+    BlobResponse,
+    CommitResponse,
+    CreateCommitInput,
+    GitProvider,
+    RefResponse,
+    TreeEntry,
+    TreeInputEntry,
+    TreeResponse,
+    UpdateRefResult,
+} from "./types.js";
+
+export type {
+    BlobResponse,
+    CommitResponse,
+    RefResponse,
+    TreeEntry,
+    TreeResponse,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // URL parsing
@@ -45,54 +80,15 @@ export function parseGitHubUrl(url: string): GitHubRepoRef | null {
 }
 
 // ---------------------------------------------------------------------------
-// Response shapes (only the fields we read)
-// ---------------------------------------------------------------------------
-
-export interface RefResponse {
-    notModified: boolean;
-    sha?: string;
-    etag?: string;
-}
-
-export interface CommitResponse {
-    sha: string;
-    treeSha: string;
-    parents: string[];
-    message: string;
-    author: {
-        name: string;
-        email: string;
-        timestamp: number; // seconds since epoch
-    };
-}
-
-export interface TreeEntry {
-    path: string;
-    mode: string;
-    type: "blob" | "tree" | "commit";
-    sha: string;
-    size?: number;
-}
-
-export interface TreeResponse {
-    sha: string;
-    truncated: boolean;
-    entries: TreeEntry[];
-}
-
-export interface BlobResponse {
-    sha: string;
-    content: string; // UTF-8 decoded
-}
-
-// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
 const ACCEPT = "application/vnd.github+json";
 const API_VERSION = "2022-11-28";
 
-export class GitHubProvider {
+export class GitHubProvider implements GitProvider {
+    public readonly canPush = true;
+
     private readonly base: string;
     private readonly headers: Record<string, string>;
 
@@ -108,6 +104,8 @@ export class GitHubProvider {
             ...(authToken ? { "Authorization": `token ${authToken}` } : {}),
         };
     }
+
+    // -- reads --------------------------------------------------------------
 
     async fetchRef(branch: string, etag?: string): Promise<RefResponse> {
         const headers = etag
@@ -225,6 +223,162 @@ export class GitHubProvider {
         const utf8 = decodeBase64Utf8(cleaned);
         return { sha: parsed.sha ?? sha, content: utf8 };
     }
+
+    // -- writes -------------------------------------------------------------
+
+    async createBlob(utf8: string): Promise<{ sha: string }> {
+        const response = await this.transport.fetch(
+            `${this.base}/git/blobs`,
+            "POST",
+            { ...this.headers, "Content-Type": "application/json" },
+            JSON.stringify({ content: utf8, encoding: "utf-8" }),
+        );
+        const parsed = this.parseWrite<{ sha?: string }>(
+            response,
+            "createBlob",
+        );
+        if (!parsed.sha) {
+            throw new Error("GitHub createBlob: response missing sha");
+        }
+        return { sha: parsed.sha };
+    }
+
+    async createTree(entries: TreeInputEntry[]): Promise<{ sha: string }> {
+        const response = await this.transport.fetch(
+            `${this.base}/git/trees`,
+            "POST",
+            { ...this.headers, "Content-Type": "application/json" },
+            JSON.stringify({
+                tree: entries.map((e) => ({
+                    path: e.path,
+                    mode: e.mode,
+                    type: e.type,
+                    sha: e.sha,
+                })),
+            }),
+        );
+        const parsed = this.parseWrite<{ sha?: string }>(
+            response,
+            "createTree",
+        );
+        if (!parsed.sha) {
+            throw new Error("GitHub createTree: response missing sha");
+        }
+        return { sha: parsed.sha };
+    }
+
+    async createCommit(input: CreateCommitInput): Promise<{ sha: string }> {
+        // Send `committer` explicitly (defaulting it to the author) so GitHub
+        // reconstructs a byte-identical commit object and reproduces the local
+        // OID. Omitting it makes GitHub stamp the committer with server time,
+        // which changes the SHA and breaks the push invariant.
+        const committer = input.committer ?? input.author;
+        const response = await this.transport.fetch(
+            `${this.base}/git/commits`,
+            "POST",
+            { ...this.headers, "Content-Type": "application/json" },
+            JSON.stringify({
+                message: input.message,
+                tree: input.tree,
+                parents: input.parents,
+                author: {
+                    name: input.author.name,
+                    email: input.author.email,
+                    date: input.author.date,
+                },
+                committer: {
+                    name: committer.name,
+                    email: committer.email,
+                    date: committer.date,
+                },
+            }),
+        );
+        const parsed = this.parseWrite<{ sha?: string }>(
+            response,
+            "createCommit",
+        );
+        if (!parsed.sha) {
+            throw new Error("GitHub createCommit: response missing sha");
+        }
+        return { sha: parsed.sha };
+    }
+
+    async updateRef(
+        branch: string,
+        sha: string,
+        opts?: { force?: boolean },
+    ): Promise<UpdateRefResult> {
+        const force = opts?.force ?? false;
+        const encoded = encodeURIComponent(branch);
+
+        // Fast path: try to advance an existing ref.
+        const patch = await this.transport.fetch(
+            `${this.base}/git/refs/heads/${encoded}`,
+            "PATCH",
+            { ...this.headers, "Content-Type": "application/json" },
+            JSON.stringify({ sha, force }),
+        );
+        if (patch.status >= 200 && patch.status < 300) {
+            return { ok: true };
+        }
+        // 422 = the update is not a fast-forward (remote moved). The caller
+        // pulls + merges, then retries.
+        if (patch.status === 422) {
+            return { ok: false, notFastForward: true };
+        }
+        // Any other 4xx (typically 404) means the ref does not exist yet →
+        // create it. GitHub returns 422 (handled above) for a real
+        // non-fast-forward on an existing ref, so a create attempt here is
+        // safe: if the ref does exist, create answers 422 → notFastForward.
+        if (patch.status >= 400 && patch.status < 500) {
+            return await this.createRef(encoded, sha);
+        }
+        throw new Error(
+            `GitHub updateRef: unexpected status ${patch.status} for ${branch}: ${truncate(patch.body)}`,
+        );
+    }
+
+    private async createRef(
+        encodedBranch: string,
+        sha: string,
+    ): Promise<UpdateRefResult> {
+        const create = await this.transport.fetch(
+            `${this.base}/git/refs`,
+            "POST",
+            { ...this.headers, "Content-Type": "application/json" },
+            JSON.stringify({
+                ref: `refs/heads/${decodeURIComponent(encodedBranch)}`,
+                sha,
+            }),
+        );
+        if (create.status >= 200 && create.status < 300) {
+            return { ok: true };
+        }
+        // 422 on create with an already-existing ref is effectively a race
+        // that the caller resolves by pulling + retrying.
+        if (create.status === 422) {
+            return { ok: false, notFastForward: true };
+        }
+        throw new Error(
+            `GitHub createRef: unexpected status ${create.status}: ${truncate(create.body)}`,
+        );
+    }
+
+    private parseWrite<T>(
+        response: { status: number; body: string },
+        label: string,
+    ): T {
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(
+                `GitHub ${label}: HTTP ${response.status}: ${truncate(response.body)}`,
+            );
+        }
+        const parsed = parseJson<T>(response.body);
+        if (!parsed) {
+            throw new Error(`GitHub ${label}: unparseable response body`);
+        }
+        return parsed;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +392,11 @@ function parseJson<T>(body: string): T | null {
     } catch (_e) {
         return null;
     }
+}
+
+function truncate(body: string, max = 200): string {
+    if (!body) return "";
+    return body.length > max ? `${body.slice(0, max)}…` : body;
 }
 
 function decodeBase64Utf8(b64: string): string {

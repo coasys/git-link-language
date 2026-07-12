@@ -17,10 +17,10 @@
 import type {
     BlobResponse,
     CommitResponse,
-    GitHubProvider,
+    GitProvider,
     RefResponse,
     TreeResponse,
-} from "../src/providers/github.js";
+} from "../src/providers/types.js";
 import type { LinkExpression } from "../src/types.js";
 import { serializeLink } from "../src/encoding.js";
 
@@ -124,10 +124,11 @@ export class FakeRemote {
     }
 
     /**
-     * A `GitHubProvider`-shaped view over this remote. `remote-sync.ts`
-     * only calls the four read methods.
+     * A `GitProvider`-shaped view over this remote. `remote-sync.ts`'s pull
+     * path only calls the four read methods, so this read-only stand-in is
+     * sufficient (it reports `canPush=false` and its write methods reject).
      */
-    asProvider(): GitHubProvider {
+    asProvider(): GitProvider {
         const self = this;
         const provider = {
             async fetchRef(branch: string, etag?: string): Promise<RefResponse> {
@@ -171,7 +172,20 @@ export class FakeRemote {
                 }
                 return { sha, content };
             },
+            canPush: false,
+            createBlob(): Promise<{ sha: string }> {
+                return Promise.reject(new Error("FakeRemote is read-only"));
+            },
+            createTree(): Promise<{ sha: string }> {
+                return Promise.reject(new Error("FakeRemote is read-only"));
+            },
+            createCommit(): Promise<{ sha: string }> {
+                return Promise.reject(new Error("FakeRemote is read-only"));
+            },
+            updateRef(): Promise<{ ok: boolean; notFastForward?: boolean }> {
+                return Promise.reject(new Error("FakeRemote is read-only"));
+            },
         };
-        return provider as unknown as GitHubProvider;
+        return provider satisfies GitProvider;
     }
 }
