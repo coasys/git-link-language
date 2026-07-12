@@ -22,6 +22,7 @@ import {
     startRemoteSync,
 } from "../src/remote-sync.js";
 import type { LinkExpression, PerspectiveDiff } from "../src/types.js";
+import { FakeRemote } from "./fake-remote.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -211,50 +212,43 @@ describe("pullOnce: applies remote additions", () => {
 });
 
 // ---------------------------------------------------------------------------
-// pullOnce — removals when remote drops a link
+// pullOnce — removals arrive as an observed tombstone in the remote chain
+//
+// A removal is only observable when the remote history actually contains a
+// commit that dropped the link. An empty remote head tree at first contact
+// is NOT a removal — with no shared base there is nothing to tombstone, so
+// the OR-Set treats first contact as a union (see the convergence suite for
+// the divergent add-vs-remove case). Here the local replica already shares
+// the add (commit-A) with the remote, then the remote publishes commit-B
+// that removes it; walking the ancestry fast-forwards local onto B and the
+// net diff is a removal.
 // ---------------------------------------------------------------------------
 
-describe("pullOnce: applies remote removals", () => {
+describe("pullOnce: applies remote removals via an observed tombstone", () => {
     beforeEach(setup);
 
-    it("removes links present locally but absent from the remote tree", async () => {
+    it("fast-forwards over a remote commit that drops a shared link", async () => {
+        const remote = new FakeRemote("main");
         const link = makeLink({ source: "to-be-removed" });
-        await ops.commit({
-            fs,
-            diff: { additions: [link], removals: [] },
-            authorDid: TEST_DID,
-        });
         const linkHash = store.hashLink(link);
+
+        // commit-A: remote adds the link. Local pulls and adopts it.
+        remote.commit(new Map([[linkHash, link]]));
+        const provider = remote.asProvider();
+        const firstDiff = await pullOnce({ provider, branch: "main", intervalMs: 1000, fs, agentDid: TEST_DID });
+        assert.equal(firstDiff.additions.length, 1);
         assert.equal(store.allLinks().links.length, 1);
 
-        const transport = new MockTransport(({ url }) => {
-            if (url.endsWith("/git/refs/heads/main")) {
-                return ok({ object: { sha: "commit-2" } });
-            }
-            if (url.includes("/git/commits/commit-2")) {
-                return ok({
-                    sha: "commit-2",
-                    tree: { sha: "tree-2" },
-                    parents: [],
-                    message: "drop",
-                    author: { name: "r", email: "r@ad4m", date: "2026-06-12T00:00:00Z" },
-                });
-            }
-            if (url.includes("/git/trees/tree-2")) {
-                // Empty tree → all local links should be removed
-                return ok({ sha: "tree-2", tree: [] });
-            }
-            throw new Error(`Unexpected URL: ${url}`);
-        });
-
-        const provider = buildProvider(transport);
+        // commit-B: remote removes the link (empty link-set). Now that local
+        // shares commit-A's ancestry, this is a genuine fast-forward whose
+        // net effect is the tombstone.
+        remote.commit(new Map());
         const diff = await pullOnce({ provider, branch: "main", intervalMs: 1000, fs, agentDid: TEST_DID });
 
         assert.equal(diff.additions.length, 0);
         assert.equal(diff.removals.length, 1);
         assert.equal(diff.removals[0].data.source, "to-be-removed");
         assert.equal(store.allLinks().links.length, 0);
-        void linkHash;
     });
 });
 
@@ -265,49 +259,34 @@ describe("pullOnce: applies remote removals", () => {
 describe("pullOnce: no link-set change", () => {
     beforeEach(setup);
 
-    it("updates tracking but does not produce a commit when the tree matches", async () => {
+    it("updates tracking but emits nothing when a new commit leaves the link-set unchanged", async () => {
+        const remote = new FakeRemote("main");
         const link = makeLink({ source: "stable" });
-        await ops.commit({
-            fs,
-            diff: { additions: [link], removals: [] },
-            authorDid: TEST_DID,
-        });
         const linkHash = store.hashLink(link);
 
-        const transport = new MockTransport(({ url }) => {
-            if (url.endsWith("/git/refs/heads/main")) {
-                return ok({ object: { sha: "commit-3" } }, { etag: "W/\"e3\"" });
-            }
-            if (url.includes("/git/commits/commit-3")) {
-                return ok({
-                    sha: "commit-3",
-                    tree: { sha: "tree-3" },
-                    parents: [],
-                    message: "no-op",
-                    author: { name: "r", email: "r@ad4m", date: "2026-06-12T00:00:00Z" },
-                });
-            }
-            if (url.includes("/git/trees/tree-3")) {
-                return ok({
-                    sha: "tree-3",
-                    tree: [
-                        { path: `links/${linkHash}.json`, type: "blob", mode: "100644", sha: "blob-3" },
-                    ],
-                });
-            }
-            throw new Error(`Unexpected URL: ${url}`);
-        });
+        // First contact: remote adds the link, local adopts it.
+        remote.commit(new Map([[linkHash, link]]));
+        const provider = remote.asProvider();
+        await pullOnce({ provider, branch: "main", intervalMs: 1000, fs, agentDid: TEST_DID });
+        assert.equal(store.allLinks().links.length, 1);
 
+        // Remote advances the head to a NEW commit that carries the SAME
+        // link-set (distinct message → distinct SHA, identical tree). This is
+        // a genuine fast-forward with an empty net link-set delta.
+        const advancedSha = remote.commit(new Map([[linkHash, link]]), {
+            message: "metadata-only advance",
+        });
         const emittedBefore = runtime.emittedDiffs.length;
-        const provider = buildProvider(transport);
+
         const diff = await pullOnce({ provider, branch: "main", intervalMs: 1000, fs, agentDid: TEST_DID });
 
         assert.deepEqual(diff, { additions: [], removals: [] });
-        // Tracking updated even though diff is empty
-        assert.equal(getRemoteSha(), "commit-3");
-        assert.equal(getRemoteEtag(), "W/\"e3\"");
-        // No new emission
+        // Tracking followed the new remote head even though nothing changed.
+        assert.equal(getRemoteSha(), advancedSha);
+        assert.ok(getRemoteEtag());
+        // No spurious emission for a zero-delta advance.
         assert.equal(runtime.emittedDiffs.length, emittedBefore);
+        assert.equal(store.allLinks().links.length, 1);
     });
 });
 
