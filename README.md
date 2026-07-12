@@ -4,15 +4,18 @@ An AD4M Link Language that backs Perspectives with a real Git repository. Every 
 
 Built with the modern [ALDK](https://github.com/coasys/ad4m/tree/dev/ad4m-ldk) (`@coasys/ad4m-ldk`) pattern.
 
-**Status:** v0.1, local-first only. See [Known Limitation: Remote Sync](#known-limitation-remote-sync) below.
+**Status:** v0.1. Bidirectional convergence: the pull path walks remote commit ancestry and OR-Set-merges divergent histories into a genuine two-parent merge commit. Push (write-back to the remote) is the remaining follow-up.
+
+The commit DAG **is** the convergence substrate this Language exposes to AD4M — the `perspective-sync` revision is the HEAD commit SHA (a content hash), and convergence is a DAG operation (ancestry walk + merge), not a snapshot fetch-and-replace. See [Diff-DAG convergence](#diff-dag-convergence).
 
 ---
 
 ## What it does
 
 - **One commit per `PerspectiveDiff`.** Additions write `links/<hash>.json` files in the working tree; removals delete them; both are staged and committed in a single Git commit signed under a DID-derived committer identity.
+- **Convergent remote sync.** The pull path walks the remote commit chain back to the last commit it already mirrored, reconstructs each missing commit locally as a real Git object (preserving remote author/message/timestamp), then fast-forwards or — on genuine divergence — writes an **OR-Set merge commit** keyed by link hash. `MERGE_POLICY` resolves a concurrent add-vs-remove of the same hash.
 - **Full local history.** Custom `git-history`, `git-state-at`, and `git-blame` query kinds expose the commit DAG, render the Perspective as it existed at any past SHA, and locate the commit that introduced a given link.
-- **Fast `link-pattern` queries** against an in-memory cache that mirrors the current `links/` tree.
+- **Fast `link-pattern` queries** against an in-memory cache that mirrors the current `links/` tree. The cache is a *derived* view — HEAD is the source of truth and the cache is rebuilt from it after every convergence.
 - **Self-contained.** No external daemon, no native dependency. The bundle includes `isomorphic-git` and runs anywhere AD4M does.
 
 ---
@@ -34,8 +37,9 @@ index.ts
         └── git-blame        (find introducing commit) │
                                                     │
 src/providers/github.ts ← JSON REST client for GitHub (refs/commits/trees/blobs)
-src/remote-sync.ts ← chained-setTimeout pull loop (default 60 s, ETag-conditional)
-src/store.ts      ← in-memory cache (links, indexes, revision, remote-sha, etag)
+src/remote-sync.ts ← ancestry-walk pull + mirror + fast-forward/OR-Set-merge; chained-setTimeout loop (default 60 s, ETag-conditional)
+src/merge.ts      ← pure OR-Set fold (adds ∪ − tombstones) + MERGE_POLICY conflict resolution
+src/store.ts      ← in-memory cache (links, indexes, revision, remote-sha, etag, remote→local mirror map)
 src/fs-adapter.ts ← isomorphic-git fs over storage KV (base64-encoded binary)
 src/http-transport.ts ← iso-git HttpClient over httpFetch (binary-blocked, see below)
 src/encoding.ts   ← base64, UTF-8, link hashing, link file paths
@@ -43,7 +47,7 @@ src/encoding.ts   ← base64, UTF-8, link hashing, link file paths
 
 ### Data model
 
-A Perspective is a Git repository under the language's storage directory. Each link expression is one JSON file in `links/`, named by `hash(source + predicate + target + author + timestamp)`. The content-addressed naming makes concurrent additions merge as a clean tree-union — no textual merge conflicts on the link set itself.
+A Perspective is a Git repository under the language's storage directory. Each link expression is one JSON file in `links/`, named by `hash(source + predicate + target + author + timestamp)`. Links are therefore **immutable, content-addressed elements**: the same link has the same hash on every replica, and two different links can never collide. Concurrent additions merge as a clean tree-union, and — because add and remove both key on the identical hash — a removal on one replica converges against the original add on another with no coordinator. This is exactly what the OR-Set merge relies on (see [Diff-DAG convergence](#diff-dag-convergence)).
 
 ```
 <perspective-repo>/
@@ -71,14 +75,51 @@ The Language closes the loop by talking to Git provider **JSON REST APIs** inste
 **How the pull loop works:**
 
 1. Every `PULL_INTERVAL_MS` (default 60 s), the Language calls `GET /git/refs/heads/<branch>` with `If-None-Match: <last-etag>`. GitHub returns **304 Not Modified** for unchanged refs, and 304s do not count against the rate limit — idle Perspectives are essentially free.
-2. When the ref SHA changes, the Language fetches the commit, walks the tree recursively, fetches any newly-needed blobs, decodes them from base64, and applies the resulting diff via the standard `commit` path. The local cache + emitted `PerspectiveDiff` update like any other addLink/removeLink.
-3. The remote SHA and ETag are persisted in the cache so reboots resume cleanly.
+2. When the ref SHA changes, the Language converges via a DAG walk — **not** a snapshot of the head tree. See [Diff-DAG convergence](#diff-dag-convergence) for the full algorithm.
+3. The remote SHA, ETag, and the remote→local commit-mirror map are persisted in the cache so reboots resume the ancestry walk cleanly instead of re-mirroring.
 
-**On-demand mode (`PULL_INTERVAL_MS=0`):** the background timer is disabled, but the standard `perspective-sync.sync()` capability still routes through the same JSON-API pull. Apps trigger refreshes by calling the AD4M `perspective.pullLinks` / `perspective.sync()` RPC — useful when polling is wasteful and the UI knows when state should change (e.g. after a user "refresh" action, or driven by an external signal).
+**On-demand mode (`PULL_INTERVAL_MS=0`):** the background timer is disabled, but the standard `perspective-sync.sync()` capability still routes through the same pull. Apps trigger refreshes by calling the AD4M `perspective.pullLinks` / `perspective.sync()` RPC — useful when polling is wasteful and the UI knows when state should change (e.g. after a user "refresh" action, or driven by an external signal).
 
-**Push** (after a local `addLink`) is the follow-up: POST `/git/blobs` (base64), POST `/git/trees`, POST `/git/commits`, PATCH `/git/refs/heads/<branch>`. Same plumbing, opposite direction. Wired in a subsequent PR.
+**Push** (after a local `addLink`) is the follow-up: POST `/git/blobs` (base64), POST `/git/trees`, POST `/git/commits`, PATCH `/git/refs/heads/<branch>`. Same plumbing, opposite direction. Wired in a subsequent PR. `PUSH_DEBOUNCE_MS` is reserved for it.
 
 **Local-only fallback:** if `REMOTE_URL` is unset or points at an unsupported host (raw self-hosted Git, Radicle web seeds), the Language runs in local-only mode. `sync()` still detects external HEAD movement and emits the diff for two-peer setups that share storage out-of-band.
+
+---
+
+## Diff-DAG convergence
+
+AD4M's `perspective-sync` contract is a hash-linked **diff-DAG** with content-addressed convergence: each replica holds a causal DAG of link diffs, and any two replicas converge to the same link-set with no coordinator. This Language rides Git's native commit-DAG as that substrate — one commit per diff, and the `perspective-sync` revision is the HEAD commit SHA. Convergence is therefore a DAG operation:
+
+**1. Ancestry walk.** From the remote head, parent pointers are walked back to the last remote commit already mirrored, accumulating the ordered list of commits the local replica is missing. Each intermediate commit's own add/remove diff is applied in causal order — a multi-commit remote advance is **not** collapsed into a snapshot of the head tree (that was the bug this design fixes).
+
+**2. Local mirror.** Each missing remote commit is reconstructed as a real local Git commit (same link-set, preserving remote author/message/timestamp). Every AD4M agent keeps its own per-agent repo, so mirroring gives the incoming history a genuine, ancestry-walkable presence in the local object store — which is what lets a merge commit carry a real second parent and lets `git merge-base` find the true fork point.
+
+**3. Fast-forward or merge.**
+- If the local branch has not advanced past the remote's fork point, the branch fast-forwards onto the mirrored remote head.
+- If **both** sides advanced from a shared base (genuine divergence), the two branches are OR-Set-merged (`src/merge.ts`) and a genuine **two-parent merge commit** is written.
+
+### OR-Set merge
+
+Because links are immutable and content-addressed, the link-set is an **OR-Set** (observed-remove set):
+
+- an **add** of link `h` inserts `h`;
+- a **remove** of link `h` tombstones that specific `h`;
+- **merge** = union of adds, minus the union of tombstones.
+
+Each branch's adds/removes are derived from its **commit op-log since the merge base** (the union of every commit's add/remove ops, causal order, last-op-wins per hash), *not* from a base-vs-head snapshot diff. This distinction is load-bearing: an add-then-remove on a branch is thereby recorded as an observed tombstone even when the merge base predates the link entirely — a snapshot diff would silently lose that removal and resurrect the link. Removals stay first-class and carry the original link hash, so a removal on one branch converges against the original add on another.
+
+### MERGE_POLICY
+
+The only genuine conflict is a link hash that is **concurrently added on one branch and removed on the other** (relative to the base). `MERGE_POLICY` resolves it deterministically:
+
+- `add-wins` (default) — the link is present in the merge.
+- `remove-wins` — the tombstone wins; the link is absent.
+
+`src/merge.ts` is pure (sets in, merged set out) and order-independent by construction: union and difference commute, so applying two diffs in either order yields the same link-set and the same materialised revision.
+
+### Determinism note
+
+Cross-network convergence between two *live* AD4M nodes cannot be exercised in this repo's unit tests (no live backend). It is instead covered structurally by `tests/convergence.test.ts`, which drives the real `remote-sync` + Git plumbing against an in-memory content-addressed fake remote (`tests/fake-remote.ts`) modelling multi-commit remote histories and server-side divergence. The four acceptance properties — ancestry walk applies each intermediate diff, removal/tombstone convergence, concurrent add-vs-remove per `MERGE_POLICY`, merge order-independence, and DAG-authoritative fold from genesis — are each asserted end-to-end there.
 
 ---
 
@@ -98,19 +139,20 @@ const AUTH_TOKEN = "";                       // GitHub PAT, sent as "Authorizati
 const PULL_INTERVAL_MS = "60000";            // pull cadence; 0 or unset disables the loop
 
 //!@ad4m-template-variable
-const MERGE_POLICY = "add-wins";             // add-wins | remove-wins (push-side; not yet acted on)
+const MERGE_POLICY = "add-wins";             // add-wins | remove-wins — resolves concurrent add-vs-remove of the same link hash during divergent-history merge
 
 //!@ad4m-template-variable
-const PUSH_DEBOUNCE_MS = "5000";             // push-side; not yet acted on
+const PUSH_DEBOUNCE_MS = "5000";             // push-side; reserved for the write-back follow-up
 ```
 
 **Active in v1:**
 
 - `REMOTE_URL`, `AUTH_TOKEN`, `PULL_INTERVAL_MS`, `DEFAULT_BRANCH` — drive the JSON-API pull loop.
+- `MERGE_POLICY` — parsed once at init and threaded into every pull; decides the concurrent add-vs-remove conflict during divergent-history convergence (see [Diff-DAG convergence](#diff-dag-convergence)).
 
 **Captured for the push follow-up:**
 
-- `MERGE_POLICY`, `PUSH_DEBOUNCE_MS`.
+- `PUSH_DEBOUNCE_MS`.
 
 ---
 
@@ -164,9 +206,9 @@ For a specific link hash, locate the commit that introduced it (and the commit t
 
 ```bash
 NODE_ENV=development pnpm install
-pnpm test       # 83 tests across 31 suites
+pnpm test       # 133 tests across 54 suites
 pnpm typecheck  # tsc --noEmit
-pnpm build      # → build/bundle.js (~624KB, includes isomorphic-git)
+pnpm build      # → build/bundle.js (~632KB, includes isomorphic-git)
 ```
 
 ## Project structure
@@ -183,17 +225,21 @@ pnpm build      # → build/bundle.js (~624KB, includes isomorphic-git)
 │   ├── encoding.ts            # base64, UTF-8, link hashing, link file paths
 │   ├── fs-adapter.ts          # isomorphic-git fs over storage KV
 │   ├── http-transport.ts      # iso-git HttpClient over httpFetch (binary-blocked)
-│   ├── git.ts                 # iso-git wrappers (init, commit, log, diff, tree walk)
+│   ├── git.ts                 # iso-git wrappers (init, commit, log, diff, tree walk, low-level object plumbing, branch op-log)
+│   ├── merge.ts               # pure OR-Set fold + MERGE_POLICY conflict resolution
 │   ├── providers/github.ts    # GitHub JSON REST API client
-│   ├── remote-sync.ts         # chained-setTimeout pull loop + pullOnce
-│   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag
+│   ├── remote-sync.ts         # ancestry-walk pull + mirror + fast-forward/OR-Set-merge; setTimeout loop + pullOnce
+│   ├── store.ts               # In-memory link cache + indexes + remote-sha/etag + mirror map
 │   ├── queries.ts             # link-pattern + git-history + git-state-at + git-blame
 │   └── operations.ts          # commit, sync (pull-routed), render, currentRevision, boot
 ├── tests/
+│   ├── fake-remote.ts         # in-memory content-addressed fake remote (multi-commit histories)
 │   ├── encoding.test.ts
 │   ├── fs-adapter.test.ts
 │   ├── git-ops.test.ts
 │   ├── github-provider.test.ts
+│   ├── merge.test.ts          # pure OR-Set semantics (order-independence, tombstones, policy)
+│   ├── convergence.test.ts    # end-to-end diff-DAG: ancestry walk, divergent merge, fold
 │   ├── operations.test.ts
 │   ├── remote-sync.test.ts
 │   └── store.test.ts
