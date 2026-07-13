@@ -43,7 +43,10 @@ so pack transport is unreachable from inside the language sandbox.
   JSON read API. No JSON write path, so `canPush = false`; publishing is
   out-of-band via the operator's local `rad` node.
 - The provider is chosen by the `REMOTE_KIND × REMOTE_URL` instance parameters
-  (`auto` infers from the URL) in `src/providers/select.ts`.
+  (`auto` infers from the URL) in `src/providers/select.ts`. Setting `GIT_API_BASE`
+  overrides host-based detection: the GitHub-REST provider targets that base
+  (GitHub Enterprise, a self-hosted git-data server, or a co-located test rig) and
+  takes `owner/repo` from the URL *path*, so the repo need not live on github.com.
 
 ## Layout
 
@@ -94,3 +97,16 @@ round-trips (need real credentials + repo) and Radicle publish (needs a running
   protocol; `httpFetch` will mangle the binary pack body.
 - `interactions()` returning `[]` is the legitimate language-interface no-op, not
   a stub to fill.
+- **Sandboxed env access is denied.** The executor evaluates each language bundle
+  in a Deno runtime with `allow_env:none`. Any module-init-time *keyed* read of
+  `process.env.<KEY>` routes through `Deno.env.get`, throws `NotCapable`, and
+  aborts evaluation of the ENTIRE bundle before the language constructor is
+  exposed. Bundled node deps that probe env at import must be neutralised at build
+  time — e.g. `isomorphic-git` pulls in `ignore`, whose init reads
+  `IGNORE_TEST_WIN32`; esbuild `define` folds that read to a constant (see
+  `esbuild.ts`). Bare `process.env` (the object) is fine — only keyed reads throw.
+  `tests/bundle-sandbox.test.ts` guards the shipped bundle against both this and a
+  surviving bare-builtin `__require`. Historically such failures surfaced as a
+  misleading `"Top-level await is not allowed in synchronous evaluation"` — a red
+  herring from the executor's event-loop error handler (which relabelled every
+  event-loop error as TLA), NOT an actual top-level await.

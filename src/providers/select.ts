@@ -14,7 +14,7 @@
  */
 
 import type { Transport } from "../adapters.js";
-import { GitHubProvider, parseGitHubUrl } from "./github.js";
+import { GitHubProvider, parseGitHubUrl, parseRepoPath } from "./github.js";
 import { RadicleProvider, parseRadicleUrl } from "./radicle.js";
 import type { GitProvider } from "./types.js";
 
@@ -25,12 +25,31 @@ export interface SelectProviderOpts {
     kind: string;
     transport: Transport;
     authToken: string;
+    /**
+     * Optional GitHub-compatible API base (`GIT_API_BASE`). When set, the
+     * GitHub REST provider targets this base instead of public github.com and
+     * `owner/repo` is taken from the URL *path* (so the repo need not live on
+     * github.com). Enables GitHub Enterprise, a self-hosted git-data server,
+     * or a co-located test rig. Ignored when empty.
+     */
+    apiBase?: string;
 }
 
 export function selectProvider(opts: SelectProviderOpts): GitProvider | null {
     const { url, transport, authToken } = opts;
     if (!url || url === "<to-be-filled>") return null;
     const kind = (opts.kind || "auto").toLowerCase();
+
+    // An explicit GitHub-compatible API base overrides host-based detection:
+    // the endpoints are GitHub-REST-shaped regardless of where they are served,
+    // so `owner/repo` comes from the URL path and all calls target `apiBase`.
+    const apiBase = opts.apiBase?.trim();
+    if (apiBase) {
+        const ref = parseRepoPath(url);
+        return ref
+            ? new GitHubProvider(transport, ref, authToken, apiBase)
+            : null;
+    }
 
     if (kind === "github") {
         const ref = parseGitHubUrl(url);

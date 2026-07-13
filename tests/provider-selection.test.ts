@@ -26,6 +26,15 @@ function select(url: string, kind: string) {
     return selectProvider({ url, kind, transport: stubTransport, authToken: "" });
 }
 
+/** Capture the URL of the first transport call a provider makes. */
+class CapturingTransport implements Transport {
+    public lastUrl = "";
+    fetch(url: string): Promise<TransportResponse> {
+        this.lastUrl = url;
+        return Promise.resolve({ status: 200, headers: {}, body: '{"object":{"sha":"x"}}' });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // auto
 // ---------------------------------------------------------------------------
@@ -101,5 +110,78 @@ describe("selectProvider: canPush reflects the chosen provider", () => {
     it("Radicle → canPush false", () => {
         const p = select(RADICLE_URL, "auto");
         assert.equal(p?.canPush, false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// apiBase override (GIT_API_BASE) — GitHub-compatible base on any host
+// ---------------------------------------------------------------------------
+
+describe("selectProvider: apiBase override", () => {
+    const API_BASE = "http://127.0.0.1:7792";
+    const REPO_URL = "http://127.0.0.1:7792/c1/nh-abc";
+
+    it("returns a GitHub provider for a non-github host when apiBase is set", () => {
+        const p = selectProvider({
+            url: REPO_URL,
+            kind: "github",
+            transport: stubTransport,
+            authToken: "",
+            apiBase: API_BASE,
+        });
+        assert.ok(p instanceof GitHubProvider);
+        assert.equal(p?.canPush, true);
+    });
+
+    it("routes reads to the custom base (owner/repo from the path)", async () => {
+        const transport = new CapturingTransport();
+        const p = selectProvider({
+            url: REPO_URL,
+            kind: "auto",
+            transport,
+            authToken: "",
+            apiBase: API_BASE,
+        });
+        assert.ok(p instanceof GitHubProvider);
+        await p!.fetchRef("main");
+        assert.equal(
+            transport.lastUrl,
+            "http://127.0.0.1:7792/repos/c1/nh-abc/git/refs/heads/main",
+        );
+    });
+
+    it("wins even when the URL would not parse as a github.com repo", () => {
+        // A bare host/path that parseGitHubUrl rejects still selects a provider
+        // via the path parser once apiBase is configured.
+        const p = selectProvider({
+            url: REPO_URL,
+            kind: "auto",
+            transport: stubTransport,
+            authToken: "",
+            apiBase: API_BASE,
+        });
+        assert.ok(p instanceof GitHubProvider);
+    });
+
+    it("returns null when apiBase is set but the URL path lacks owner/repo", () => {
+        const p = selectProvider({
+            url: "http://127.0.0.1:7792/only-one",
+            kind: "auto",
+            transport: stubTransport,
+            authToken: "",
+            apiBase: API_BASE,
+        });
+        assert.equal(p, null);
+    });
+
+    it("is ignored when empty (falls back to host-based detection)", () => {
+        const p = selectProvider({
+            url: GITHUB_URL,
+            kind: "auto",
+            transport: stubTransport,
+            authToken: "",
+            apiBase: "",
+        });
+        assert.ok(p instanceof GitHubProvider);
     });
 });

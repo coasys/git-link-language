@@ -8,7 +8,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import type { Transport, TransportResponse } from "../src/adapters.js";
-import { GitHubProvider, parseGitHubUrl } from "../src/providers/github.js";
+import {
+    GitHubProvider,
+    parseGitHubUrl,
+    parseRepoPath,
+} from "../src/providers/github.js";
 
 // ---------------------------------------------------------------------------
 // parseGitHubUrl
@@ -39,6 +43,110 @@ describe("parseGitHubUrl", () => {
     it("rejects malformed paths", () => {
         assert.equal(parseGitHubUrl("https://github.com/only-one-segment"), null);
         assert.equal(parseGitHubUrl("https://github.com/"), null);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// parseRepoPath — host-agnostic owner/repo from the URL path
+// ---------------------------------------------------------------------------
+
+describe("parseRepoPath", () => {
+    it("takes the last two path segments of any host", () => {
+        assert.deepEqual(parseRepoPath("http://127.0.0.1:7792/c1/nh-abc"), {
+            owner: "c1",
+            repo: "nh-abc",
+        });
+    });
+
+    it("strips a .git suffix and trailing slash", () => {
+        assert.deepEqual(parseRepoPath("https://git.example/org/repo.git"), {
+            owner: "org",
+            repo: "repo",
+        });
+        assert.deepEqual(parseRepoPath("https://git.example/org/repo/"), {
+            owner: "org",
+            repo: "repo",
+        });
+    });
+
+    it("uses the trailing pair when the path is deeper (e.g. GHE /api/v3-style)", () => {
+        assert.deepEqual(
+            parseRepoPath("https://ghe.corp/prefix/owner/repo"),
+            { owner: "owner", repo: "repo" },
+        );
+    });
+
+    it("returns null when there are fewer than two path segments", () => {
+        assert.equal(parseRepoPath("http://127.0.0.1:7792/only-one"), null);
+        assert.equal(parseRepoPath("http://127.0.0.1:7792/"), null);
+        assert.equal(parseRepoPath(""), null);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// GitHubProvider — configurable API base (GIT_API_BASE)
+// ---------------------------------------------------------------------------
+
+describe("GitHubProvider with a custom apiBase", () => {
+    it("targets the custom base for reads instead of api.github.com", async () => {
+        const transport = new MockTransport(() =>
+            ok({ object: { sha: "abc" } }),
+        );
+        const provider = new GitHubProvider(
+            transport,
+            { owner: "c1", repo: "nh-abc" },
+            "",
+            "http://127.0.0.1:7792",
+        );
+        await provider.fetchRef("main");
+        assert.equal(
+            transport.calls[0].url,
+            "http://127.0.0.1:7792/repos/c1/nh-abc/git/refs/heads/main",
+        );
+    });
+
+    it("targets the custom base for writes (blob POST)", async () => {
+        const transport = new MockTransport(() => ok({ sha: "b1" }));
+        const provider = new GitHubProvider(
+            transport,
+            { owner: "c1", repo: "nh-abc" },
+            "",
+            "http://127.0.0.1:7792",
+        );
+        await provider.createBlob("hello");
+        assert.equal(
+            transport.calls[0].url,
+            "http://127.0.0.1:7792/repos/c1/nh-abc/git/blobs",
+        );
+    });
+
+    it("trims a trailing slash on the base so joins stay clean", async () => {
+        const transport = new MockTransport(() =>
+            ok({ object: { sha: "abc" } }),
+        );
+        const provider = new GitHubProvider(
+            transport,
+            { owner: "o", repo: "r" },
+            "",
+            "http://127.0.0.1:7792/",
+        );
+        await provider.fetchRef("main");
+        assert.equal(
+            transport.calls[0].url,
+            "http://127.0.0.1:7792/repos/o/r/git/refs/heads/main",
+        );
+    });
+
+    it("defaults to public GitHub when no base is given", async () => {
+        const transport = new MockTransport(() =>
+            ok({ object: { sha: "abc" } }),
+        );
+        const provider = new GitHubProvider(transport, { owner: "o", repo: "r" }, "");
+        await provider.fetchRef("main");
+        assert.equal(
+            transport.calls[0].url,
+            "https://api.github.com/repos/o/r/git/refs/heads/main",
+        );
     });
 });
 

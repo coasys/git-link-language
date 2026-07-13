@@ -79,6 +79,25 @@ export function parseGitHubUrl(url: string): GitHubRepoRef | null {
     return { owner: match[1], repo: match[2] };
 }
 
+/**
+ * Extract `owner/repo` from the *path* of any http(s) URL, regardless of
+ * host — the last two path segments (`.git` suffix and trailing slash
+ * stripped). Used when a GitHub-compatible API base is configured
+ * explicitly (`GIT_API_BASE`: GitHub Enterprise, a self-hosted git-data
+ * server, or a test rig) so the repo need not live on github.com. Returns
+ * null when the path has fewer than two segments.
+ */
+export function parseRepoPath(url: string): GitHubRepoRef | null {
+    if (!url) return null;
+    const withoutProto = url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, "");
+    const parts = withoutProto.split("/").filter((s) => s.length > 0);
+    if (parts.length < 2) return null;
+    const owner = parts[parts.length - 2];
+    const repo = parts[parts.length - 1].replace(/\.git$/, "");
+    if (!owner || !repo) return null;
+    return { owner, repo };
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -96,8 +115,15 @@ export class GitHubProvider implements GitProvider {
         private readonly transport: Transport,
         ref: GitHubRepoRef,
         authToken: string,
+        apiBase = "https://api.github.com",
     ) {
-        this.base = `https://api.github.com/repos/${ref.owner}/${ref.repo}`;
+        // `apiBase` defaults to public GitHub but may be overridden (GitHub
+        // Enterprise `https://host/api/v3`, a self-hosted git-data server, or
+        // a co-located test rig). The `/repos/<o>/<r>` suffix and every
+        // endpoint path below are GitHub-REST-shaped, so any base speaking that
+        // dialect works. Trailing slashes are trimmed so the joins stay clean.
+        const trimmedBase = apiBase.replace(/\/+$/, "");
+        this.base = `${trimmedBase}/repos/${ref.owner}/${ref.repo}`;
         this.headers = {
             "Accept": ACCEPT,
             "X-GitHub-Api-Version": API_VERSION,

@@ -73,6 +73,9 @@ const DEFAULT_BRANCH = "main";
 const AUTH_TOKEN = "";
 
 //!@ad4m-template-variable
+const GIT_API_BASE = "";
+
+//!@ad4m-template-variable
 const MERGE_POLICY = "add-wins";
 
 //!@ad4m-template-variable
@@ -82,7 +85,10 @@ const PUSH_DEBOUNCE_MS = "5000";
 const PULL_INTERVAL_MS = "60000";
 
 // REMOTE_KIND selects the provider ("auto" | "github" | "radicle"); "auto"
-// infers it from REMOTE_URL (see detectProvider). MERGE_POLICY resolves
+// infers it from REMOTE_URL (see detectProvider). GIT_API_BASE, when non-empty,
+// points the GitHub-REST provider at a custom base (GitHub Enterprise, a
+// self-hosted git-data server, or a test rig) and takes owner/repo from the
+// REMOTE_URL path instead of requiring a github.com host. MERGE_POLICY resolves
 // concurrent add-vs-remove of the same link hash during divergent-history
 // convergence (see src/merge.ts); it is parsed once at init and threaded
 // into every pull. PUSH_DEBOUNCE_MS coalesces bursty local commits into one
@@ -165,6 +171,7 @@ function detectProvider(): GitProvider | null {
         kind: REMOTE_KIND,
         transport: getTransport(),
         authToken: AUTH_TOKEN,
+        apiBase: GIT_API_BASE,
     });
 }
 
@@ -328,6 +335,7 @@ export const possibleTemplateParams: string[] = [
     "REMOTE_KIND",
     "DEFAULT_BRANCH",
     "AUTH_TOKEN",
+    "GIT_API_BASE",
     "MERGE_POLICY",
     "PUSH_DEBOUNCE_MS",
     "PULL_INTERVAL_MS",
