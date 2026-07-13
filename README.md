@@ -132,6 +132,19 @@ Cross-network convergence between two *live* AD4M nodes cannot be exercised in t
 
 ---
 
+## Verified live against a git-data server (co-located C1)
+
+The AD4M wind-tunnel C1 scenario runs this language end-to-end against a **co-located git-data server** that speaks the GitHub JSON git-data REST contract (`infra/git-data-shim.mjs`, backed by the same `isomorphic-git` this language hashes with, so `returnedSha === localOid` holds by construction). Two executors template one shared repo — `GIT_API_BASE` points the GitHub provider at the shim and `owner/repo` is read from the `REMOTE_URL` path, so no github.com is touched — and the harness proves convergence via each executor's own `queryLinks`. **Both agents reached 20/20 links in 6.06 s and a removal converged in 2.05 s.** This exercises, for real, what the unit suite can only fake against `tests/fake-remote.ts`:
+
+- **Wire fetches** — conditional ref reads and `commits` / `trees` / `blobs` GETs against a live HTTP server.
+- **Object write-back** — `POST` blobs → trees → commits then `PATCH` the ref, each write asserting the returned SHA equals the local OID; a non-fast-forward `422` triggers pull → **OR-Set-over-commit-ancestry** merge → retry, with the background pull timer fast-forwarding both sides to the shared head.
+
+Unlike the other backends' C1 runs, the defect this surfaced was not a convergence bug but a **masked bundle-load failure** — the language never loaded. The executor sandboxes each language bundle with `allow_env:none`, and `isomorphic-git`'s transitive `ignore` dep reads `process.env.IGNORE_TEST_WIN32` at module-init; a keyed `process.env` read routes through `Deno.env.get`, throws `NotCapable`, and aborts the whole bundle before the language constructor is exposed. The executor then *mislabelled* it as "Top-level await is not allowed in synchronous evaluation" (a hardcoded `CoreError::TLA` masking every event-loop error), which hid the real cause across multiple sessions. The build-time fix (an esbuild `define` folding the read to a constant) is regression-guarded by `tests/bundle-sandbox.test.ts` and documented in `AGENTS.md`; the executor observability fix rides a separate `ad4m` branch.
+
+Live github.com round-trips and Radicle publish remain **out-of-band from CI** (see [Remote sync](#remote-sync)) — the hermetic shim proves convergence against the GitHub REST *contract*, not the hosted service.
+
+---
+
 ## Template variables
 
 ```typescript
